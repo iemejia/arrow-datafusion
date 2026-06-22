@@ -16,17 +16,17 @@
 // under the License.
 
 mod aggregate;
-mod built_in;
-mod built_in_window_function_expr;
-pub(crate) mod cume_dist;
-pub(crate) mod lead_lag;
-pub(crate) mod nth_value;
-pub(crate) mod partition_evaluator;
-pub(crate) mod rank;
-pub(crate) mod row_number;
+mod sliding_aggregate;
+mod standard;
+mod standard_window_function_expr;
 mod window_expr;
 
-pub use aggregate::AggregateWindowExpr;
-pub use built_in::BuiltInWindowExpr;
-pub use built_in_window_function_expr::BuiltInWindowFunctionExpr;
+pub use aggregate::PlainAggregateWindowExpr;
+pub use sliding_aggregate::SlidingAggregateWindowExpr;
+pub use standard::StandardWindowExpr;
+pub use standard_window_function_expr::StandardWindowFunctionExpr;
+pub use window_expr::PartitionBatches;
+pub use window_expr::PartitionKey;
+pub use window_expr::PartitionWindowAggStates;
 pub use window_expr::WindowExpr;
+pub use window_expr::WindowState;

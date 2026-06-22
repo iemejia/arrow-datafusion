@@ -26,18 +26,17 @@
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
-#
-# import os
-# import sys
-# sys.path.insert(0, os.path.abspath('.'))
+import os
+import sys
 
-import datafusion
+# To pickup rustdoc_trim.py
+sys.path.insert(0, os.path.abspath(".."))
 
 # -- Project information -----------------------------------------------------
 
-project = 'Arrow DataFusion'
-copyright = '2022, Apache Software Foundation'
-author = 'Arrow DataFusion Authors'
+project = "Apache DataFusion"
+copyright = "2019-2025, Apache Software Foundation"
+author = "Apache Software Foundation"
 
 
 # -- General configuration ---------------------------------------------------
@@ -46,23 +45,25 @@ author = 'Arrow DataFusion Authors'
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 extensions = [
-    'sphinx.ext.autodoc',
-    'sphinx.ext.autosummary',
-    'sphinx.ext.doctest',
-    'sphinx.ext.ifconfig',
-    'sphinx.ext.mathjax',
-    'sphinx.ext.viewcode',
-    'sphinx.ext.napoleon',
-    'myst_parser',
+    "sphinx.ext.autodoc",
+    "sphinx.ext.autosummary",
+    "sphinx.ext.doctest",
+    "sphinx.ext.ifconfig",
+    "sphinx.ext.mathjax",
+    "sphinx.ext.viewcode",
+    "sphinx.ext.napoleon",
+    "myst_parser",
+    "sphinx_reredirects",
+    "rustdoc_trim",
 ]
 
 source_suffix = {
-    '.rst': 'restructuredtext',
-    '.md': 'markdown',
+    ".rst": "restructuredtext",
+    ".md": "markdown",
 }
 
 # Add any paths that contain templates here, relative to this directory.
-templates_path = ['_templates']
+templates_path = ["_templates"]
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
@@ -84,25 +85,35 @@ autosummary_generate = True
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
 #
-html_theme = 'pydata_sphinx_theme'
+html_theme = "pydata_sphinx_theme"
 
 html_theme_options = {
+     "logo": {
+        "image_light": "_static/images/original.svg", 
+        "image_dark": "_static/images/original_dark.svg", 
+    },
     "use_edit_page_button": True,
+    "navbar_center": [],
+    "navbar_end": ["theme-switcher"],
 }
 
 html_context = {
     "github_user": "apache",
     "github_repo": "arrow-datafusion",
-    "github_version": "master",
+    "github_version": "main",
     "doc_path": "docs/source",
 }
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ['_static']
+html_static_path = ["_static"]
 
-html_logo = "_static/images/DataFusion-Logo-Background-White.png"
+# Copy agent-facing files (llms.txt) verbatim to the site root so they
+# resolve at the conventional URL `https://datafusion.apache.org/llms.txt`.
+html_extra_path = ["llms.txt"]
+
+html_logo = "_static/images/2x_bgwhite_original.png"
 
 html_css_files = ["theme_overrides.css"]
 
@@ -110,8 +121,22 @@ html_sidebars = {
     "**": ["docs-sidebar.html"],
 }
 
+html_favicon = '_static/favicon.svg'
+
 # tell myst_parser to auto-generate anchor links for headers h1, h2, h3
 myst_heading_anchors = 3
 
 # enable nice rendering of checkboxes for the task lists
-myst_enable_extensions = [ "tasklist"]
+myst_enable_extensions = ["colon_fence", "deflist", "tasklist"]
+
+# Some code blocks (sql) are not being highlighted correctly, due to the
+# presence of some special characters like: 🚀, å, {,... But this isn’t a major
+# issue for our documentation. So, suppress these warnings to keep our build
+# log cleaner.
+suppress_warnings = ["misc.highlighting_failure"]
+
+redirects = {
+    "library-user-guide/adding-udfs": "functions/index.html",
+    "user-guide/runtime_configs": "configs.html",
+    "library-user-guide/upgrading": "/library-user-guide/upgrading/index.html",
+}

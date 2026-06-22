@@ -23,30 +23,77 @@
 //! - An ending frame boundary,
 //! - An EXCLUDE clause.
 
-use datafusion_common::{DataFusionError, Result};
-use sqlparser::ast;
-use std::cmp::Ordering;
-use std::convert::{From, TryFrom};
-use std::fmt;
-use std::hash::{Hash, Hasher};
+use crate::{expr::Sort, lit};
+use std::fmt::{self, Formatter};
+use std::hash::Hash;
 
-/// The frame-spec determines which output rows are read by an aggregate window function.
-///
-/// The ending frame boundary can be omitted (if the BETWEEN and AND keywords that surround the
-/// starting frame boundary are also omitted), in which case the ending frame boundary defaults to
-/// CURRENT ROW.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash)]
+use datafusion_common::{Result, ScalarValue, plan_err};
+#[cfg(feature = "sql")]
+use sqlparser::ast::{self, ValueWithSpan};
+
+/// The frame specification determines which output rows are read by an aggregate
+/// window function. The ending frame boundary can be omitted if the `BETWEEN`
+/// and `AND` keywords that surround the starting frame boundary are also omitted,
+/// in which case the ending frame boundary defaults to `CURRENT ROW`.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub struct WindowFrame {
-    /// A frame type - either ROWS, RANGE or GROUPS
+    /// Frame type - either `ROWS`, `RANGE` or `GROUPS`
     pub units: WindowFrameUnits,
-    /// A starting frame boundary
+    /// Starting frame boundary
     pub start_bound: WindowFrameBound,
-    /// An ending frame boundary
+    /// Ending frame boundary
     pub end_bound: WindowFrameBound,
+    /// Flag indicating whether the frame is causal (i.e. computing the result
+    /// for the current row doesn't depend on any subsequent rows).
+    ///
+    /// Example causal window frames:
+    /// ```text
+    ///                +--------------+
+    ///      Future    |              |
+    ///         |      |              |
+    ///         |      |              |
+    ///    Current Row |+------------+|  ---
+    ///         |      |              |   |
+    ///         |      |              |   |
+    ///         |      |              |   |  Window Frame 1
+    ///       Past     |              |   |
+    ///                |              |   |
+    ///                |              |  ---
+    ///                +--------------+
+    ///
+    ///                +--------------+
+    ///      Future    |              |
+    ///         |      |              |
+    ///         |      |              |
+    ///    Current Row |+------------+|
+    ///         |      |              |
+    ///         |      |              | ---
+    ///         |      |              |  |
+    ///       Past     |              |  |  Window Frame 2
+    ///                |              |  |
+    ///                |              | ---
+    ///                +--------------+
+    /// ```
+    /// Example non-causal window frame:
+    /// ```text
+    ///                +--------------+
+    ///      Future    |              |
+    ///         |      |              |
+    ///         |      |              | ---
+    ///    Current Row |+------------+|  |
+    ///         |      |              |  |  Window Frame 3
+    ///         |      |              |  |
+    ///         |      |              | ---
+    ///       Past     |              |
+    ///                |              |
+    ///                |              |
+    ///                +--------------+
+    /// ```
+    causal: bool,
 }
 
 impl fmt::Display for WindowFrame {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "{} BETWEEN {} AND {}",
@@ -56,86 +103,216 @@ impl fmt::Display for WindowFrame {
     }
 }
 
-impl TryFrom<ast::WindowFrame> for WindowFrame {
-    type Error = DataFusionError;
-
-    fn try_from(value: ast::WindowFrame) -> Result<Self> {
-        let start_bound = value.start_bound.into();
-        let end_bound = value
-            .end_bound
-            .map(WindowFrameBound::from)
-            .unwrap_or(WindowFrameBound::CurrentRow);
-
-        if let WindowFrameBound::Following(None) = start_bound {
-            Err(DataFusionError::Execution(
-                "Invalid window frame: start bound cannot be unbounded following"
-                    .to_owned(),
-            ))
-        } else if let WindowFrameBound::Preceding(None) = end_bound {
-            Err(DataFusionError::Execution(
-                "Invalid window frame: end bound cannot be unbounded preceding"
-                    .to_owned(),
-            ))
-        } else if start_bound > end_bound {
-            Err(DataFusionError::Execution(format!(
-        "Invalid window frame: start bound ({}) cannot be larger than end bound ({})",
-        start_bound, end_bound
-      )))
-        } else {
-            let units = value.units.into();
-            if units == WindowFrameUnits::Range {
-                for bound in &[start_bound, end_bound] {
-                    match bound {
-                        WindowFrameBound::Preceding(Some(v))
-                        | WindowFrameBound::Following(Some(v))
-                            if *v > 0 =>
-                        {
-                            Err(DataFusionError::NotImplemented(format!(
-                                "With WindowFrameUnits={}, the bound cannot be {} PRECEDING or FOLLOWING at the moment",
-                                units, v
-                            )))
-                        }
-                        _ => Ok(()),
-                    }?;
-                }
-            }
-            Ok(Self {
-                units,
-                start_bound,
-                end_bound,
-            })
-        }
+impl fmt::Debug for WindowFrame {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "WindowFrame {{ units: {:?}, start_bound: {:?}, end_bound: {:?}, is_causal: {:?} }}",
+            self.units, self.start_bound, self.end_bound, self.causal
+        )?;
+        Ok(())
     }
 }
 
-impl Default for WindowFrame {
-    fn default() -> Self {
-        WindowFrame {
-            units: WindowFrameUnits::Range,
-            start_bound: WindowFrameBound::Preceding(None),
-            end_bound: WindowFrameBound::CurrentRow,
+#[cfg(feature = "sql")]
+impl TryFrom<ast::WindowFrame> for WindowFrame {
+    type Error = datafusion_common::error::DataFusionError;
+
+    fn try_from(value: ast::WindowFrame) -> Result<Self> {
+        let start_bound = WindowFrameBound::try_parse(value.start_bound, &value.units)?;
+        let end_bound = match value.end_bound {
+            Some(bound) => WindowFrameBound::try_parse(bound, &value.units)?,
+            None => WindowFrameBound::CurrentRow,
+        };
+
+        if let WindowFrameBound::Following(val) = &start_bound {
+            if val.is_null() {
+                plan_err!(
+                    "Invalid window frame: start bound cannot be UNBOUNDED FOLLOWING"
+                )?
+            }
+        } else if let WindowFrameBound::Preceding(val) = &end_bound
+            && val.is_null()
+        {
+            plan_err!("Invalid window frame: end bound cannot be UNBOUNDED PRECEDING")?
+        };
+
+        let units = value.units.into();
+        Ok(Self::new_bounds(units, start_bound, end_bound))
+    }
+}
+
+impl WindowFrame {
+    /// Creates a new, default window frame (with the meaning of default
+    /// depending on whether the frame contains an `ORDER BY` clause and this
+    /// ordering is strict (i.e. no ties).
+    pub fn new(order_by: Option<bool>) -> Self {
+        if let Some(strict) = order_by {
+            // This window frame covers the table (or partition if `PARTITION BY`
+            // is used) from beginning to the `CURRENT ROW` (with same rank). It
+            // is used when the `OVER` clause contains an `ORDER BY` clause but
+            // no frame.
+            Self {
+                units: if strict {
+                    WindowFrameUnits::Rows
+                } else {
+                    WindowFrameUnits::Range
+                },
+                start_bound: WindowFrameBound::Preceding(ScalarValue::UInt64(None)),
+                end_bound: WindowFrameBound::CurrentRow,
+                causal: strict,
+            }
+        } else {
+            // This window frame covers the whole table (or partition if `PARTITION BY`
+            // is used). It is used when the `OVER` clause does not contain an
+            // `ORDER BY` clause and there is no frame.
+            Self {
+                units: WindowFrameUnits::Rows,
+                start_bound: WindowFrameBound::Preceding(ScalarValue::UInt64(None)),
+                end_bound: WindowFrameBound::Following(ScalarValue::UInt64(None)),
+                causal: false,
+            }
         }
+    }
+
+    /// Get reversed window frame. For example
+    /// `3 ROWS PRECEDING AND 2 ROWS FOLLOWING` -->
+    /// `2 ROWS PRECEDING AND 3 ROWS FOLLOWING`
+    pub fn reverse(&self) -> Self {
+        let start_bound = match &self.end_bound {
+            WindowFrameBound::Preceding(value) => {
+                WindowFrameBound::Following(value.clone())
+            }
+            WindowFrameBound::Following(value) => {
+                WindowFrameBound::Preceding(value.clone())
+            }
+            WindowFrameBound::CurrentRow => WindowFrameBound::CurrentRow,
+        };
+        let end_bound = match &self.start_bound {
+            WindowFrameBound::Preceding(value) => {
+                WindowFrameBound::Following(value.clone())
+            }
+            WindowFrameBound::Following(value) => {
+                WindowFrameBound::Preceding(value.clone())
+            }
+            WindowFrameBound::CurrentRow => WindowFrameBound::CurrentRow,
+        };
+        Self::new_bounds(self.units, start_bound, end_bound)
+    }
+
+    /// Get whether window frame is causal
+    pub fn is_causal(&self) -> bool {
+        self.causal
+    }
+
+    /// Initializes window frame from units (type), start bound and end bound.
+    pub fn new_bounds(
+        units: WindowFrameUnits,
+        start_bound: WindowFrameBound,
+        end_bound: WindowFrameBound,
+    ) -> Self {
+        let causal = match units {
+            WindowFrameUnits::Rows => match &end_bound {
+                WindowFrameBound::Following(value) => {
+                    if value.is_null() {
+                        // Unbounded following
+                        false
+                    } else {
+                        let zero = ScalarValue::new_zero(&value.data_type());
+                        zero.map(|zero| value.eq(&zero)).unwrap_or(false)
+                    }
+                }
+                _ => true,
+            },
+            WindowFrameUnits::Range | WindowFrameUnits::Groups => match &end_bound {
+                WindowFrameBound::Preceding(value) => {
+                    if value.is_null() {
+                        // Unbounded preceding
+                        true
+                    } else {
+                        let zero = ScalarValue::new_zero(&value.data_type());
+                        zero.map(|zero| value.gt(&zero)).unwrap_or(false)
+                    }
+                }
+                _ => false,
+            },
+        };
+        Self {
+            units,
+            start_bound,
+            end_bound,
+            causal,
+        }
+    }
+
+    /// Regularizes the ORDER BY clause of the window frame.
+    pub fn regularize_order_bys(&self, order_by: &mut Vec<Sort>) -> Result<()> {
+        match self.units {
+            // Normally, RANGE frames require an ORDER BY clause with exactly
+            // one column. However, an ORDER BY clause may be absent or have
+            // more than one column when the start/end bounds are UNBOUNDED or
+            // CURRENT ROW.
+            WindowFrameUnits::Range if self.free_range() && order_by.is_empty() => {
+                // If an ORDER BY clause is absent, it is equivalent to an
+                // ORDER BY clause with constant value as sort key. If an
+                // ORDER BY clause is present but has more than one column,
+                // it is unchanged. Note that this follows PostgreSQL behavior.
+                order_by.push(lit(1u64).sort(true, false));
+            }
+            WindowFrameUnits::Range if self.free_range() => {}
+            WindowFrameUnits::Range if order_by.len() != 1 => {
+                return plan_err!("RANGE requires exactly one ORDER BY column");
+            }
+            WindowFrameUnits::Groups if order_by.is_empty() => {
+                return plan_err!("GROUPS requires an ORDER BY clause");
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Returns whether the window frame can accept multiple ORDER BY expressions.
+    pub fn can_accept_multi_orderby(&self) -> bool {
+        match self.units {
+            WindowFrameUnits::Rows => true,
+            WindowFrameUnits::Range => self.free_range(),
+            WindowFrameUnits::Groups => true,
+        }
+    }
+
+    /// Returns whether the window frame is "free range"; i.e. its start/end
+    /// bounds are UNBOUNDED or CURRENT ROW.
+    fn free_range(&self) -> bool {
+        (self.start_bound.is_unbounded()
+            || self.start_bound == WindowFrameBound::CurrentRow)
+            && (self.end_bound.is_unbounded()
+                || self.end_bound == WindowFrameBound::CurrentRow)
+    }
+
+    /// Is the window frame ever-expanding (it always grows in the superset sense).
+    /// Useful when understanding if set-monotonicity properties of functions can
+    /// be exploited.
+    pub fn is_ever_expanding(&self) -> bool {
+        self.start_bound.is_unbounded()
     }
 }
 
 /// There are five ways to describe starting and ending frame boundaries:
 ///
 /// 1. UNBOUNDED PRECEDING
-/// 2. <expr> PRECEDING
+/// 2. `<expr>` PRECEDING
 /// 3. CURRENT ROW
-/// 4. <expr> FOLLOWING
+/// 4. `<expr>` FOLLOWING
 /// 5. UNBOUNDED FOLLOWING
-///
-/// in this implementation we'll only allow <expr> to be u64 (i.e. no dynamic boundary)
-#[derive(Debug, Clone, Copy, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub enum WindowFrameBound {
     /// 1. UNBOUNDED PRECEDING
-    /// The frame boundary is the first row in the partition.
+    ///    The frame boundary is the first row in the partition.
     ///
-    /// 2. <expr> PRECEDING
-    /// <expr> must be a non-negative constant numeric expression. The boundary is a row that
-    /// is <expr> "units" prior to the current row.
-    Preceding(Option<u64>),
+    /// 2. `<expr>` PRECEDING
+    ///    `<expr>` must be a non-negative constant numeric expression. The boundary is a row that
+    ///    is `<expr>` "units" prior to the current row.
+    Preceding(ScalarValue),
     /// 3. The current row.
     ///
     /// For RANGE and GROUPS frame types, peers of the current row are also
@@ -143,75 +320,136 @@ pub enum WindowFrameBound {
     /// This is true regardless of whether CURRENT ROW is used as the starting or ending frame
     /// boundary.
     CurrentRow,
-    /// 4. This is the same as "<expr> PRECEDING" except that the boundary is <expr> units after the
-    /// current rather than before the current row.
+    /// 4. This is the same as "`<expr>` PRECEDING" except that the boundary is `<expr>` units after the
+    ///    current rather than before the current row.
     ///
     /// 5. UNBOUNDED FOLLOWING
-    /// The frame boundary is the last row in the partition.
-    Following(Option<u64>),
+    ///    The frame boundary is the last row in the partition.
+    Following(ScalarValue),
 }
 
-impl From<ast::WindowFrameBound> for WindowFrameBound {
-    fn from(value: ast::WindowFrameBound) -> Self {
-        match value {
-            ast::WindowFrameBound::Preceding(v) => Self::Preceding(v),
-            ast::WindowFrameBound::Following(v) => Self::Following(v),
-            ast::WindowFrameBound::CurrentRow => Self::CurrentRow,
-        }
-    }
-}
-
-impl fmt::Display for WindowFrameBound {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl WindowFrameBound {
+    pub fn is_unbounded(&self) -> bool {
         match self {
-            WindowFrameBound::CurrentRow => f.write_str("CURRENT ROW"),
-            WindowFrameBound::Preceding(None) => f.write_str("UNBOUNDED PRECEDING"),
-            WindowFrameBound::Following(None) => f.write_str("UNBOUNDED FOLLOWING"),
-            WindowFrameBound::Preceding(Some(n)) => write!(f, "{} PRECEDING", n),
-            WindowFrameBound::Following(Some(n)) => write!(f, "{} FOLLOWING", n),
+            WindowFrameBound::Preceding(elem) => elem.is_null(),
+            WindowFrameBound::CurrentRow => false,
+            WindowFrameBound::Following(elem) => elem.is_null(),
         }
-    }
-}
-
-impl PartialEq for WindowFrameBound {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl PartialOrd for WindowFrameBound {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for WindowFrameBound {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.get_rank().cmp(&other.get_rank())
-    }
-}
-
-impl Hash for WindowFrameBound {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.get_rank().hash(state)
     }
 }
 
 impl WindowFrameBound {
-    /// get the rank of this window frame bound.
-    ///
-    /// the rank is a tuple of (u8, u64) because we'll firstly compare the kind and then the value
-    /// which requires special handling e.g. with preceding the larger the value the smaller the
-    /// rank and also for 0 preceding / following it is the same as current row
-    fn get_rank(&self) -> (u8, u64) {
+    #[cfg(feature = "sql")]
+    fn try_parse(
+        value: ast::WindowFrameBound,
+        units: &ast::WindowFrameUnits,
+    ) -> Result<Self> {
+        Ok(match value {
+            ast::WindowFrameBound::Preceding(Some(v)) => {
+                Self::Preceding(convert_frame_bound_to_scalar_value(*v, units)?)
+            }
+            ast::WindowFrameBound::Preceding(None) => {
+                Self::Preceding(ScalarValue::UInt64(None))
+            }
+            ast::WindowFrameBound::Following(Some(v)) => {
+                Self::Following(convert_frame_bound_to_scalar_value(*v, units)?)
+            }
+            ast::WindowFrameBound::Following(None) => {
+                Self::Following(ScalarValue::UInt64(None))
+            }
+            ast::WindowFrameBound::CurrentRow => Self::CurrentRow,
+        })
+    }
+}
+
+#[cfg(feature = "sql")]
+fn convert_frame_bound_to_scalar_value(
+    v: ast::Expr,
+    units: &ast::WindowFrameUnits,
+) -> Result<ScalarValue> {
+    use arrow::datatypes::DataType;
+    use datafusion_common::exec_err;
+    match units {
+        // For ROWS and GROUPS we are sure that the ScalarValue must be a non-negative integer ...
+        ast::WindowFrameUnits::Rows | ast::WindowFrameUnits::Groups => match v {
+            ast::Expr::Value(ValueWithSpan {
+                value: ast::Value::Number(value, false),
+                span: _,
+            }) => Ok(ScalarValue::try_from_string(value, &DataType::UInt64)?),
+            ast::Expr::Interval(ast::Interval {
+                value,
+                leading_field: None,
+                leading_precision: None,
+                last_field: None,
+                fractional_seconds_precision: None,
+            }) => {
+                let value = match *value {
+                    ast::Expr::Value(ValueWithSpan {
+                        value: ast::Value::SingleQuotedString(item),
+                        span: _,
+                    }) => item,
+                    e => {
+                        return exec_err!("INTERVAL expression cannot be {e:?}");
+                    }
+                };
+                Ok(ScalarValue::try_from_string(value, &DataType::UInt64)?)
+            }
+            _ => plan_err!(
+                "Invalid window frame: frame offsets for ROWS / GROUPS must be non negative integers"
+            ),
+        },
+        // ... instead for RANGE it could be anything depending on the type of the ORDER BY clause,
+        // so we use a ScalarValue::Utf8.
+        ast::WindowFrameUnits::Range => Ok(ScalarValue::Utf8(Some(match v {
+            ast::Expr::Value(ValueWithSpan {
+                value: ast::Value::Number(value, false),
+                span: _,
+            }) => value,
+            ast::Expr::Interval(ast::Interval {
+                value,
+                leading_field,
+                ..
+            }) => {
+                let result = match *value {
+                    ast::Expr::Value(ValueWithSpan {
+                        value: ast::Value::SingleQuotedString(item),
+                        span: _,
+                    }) => item,
+                    e => {
+                        return exec_err!("INTERVAL expression cannot be {e:?}");
+                    }
+                };
+                if let Some(leading_field) = leading_field {
+                    format!("{result} {leading_field}")
+                } else {
+                    result
+                }
+            }
+            _ => plan_err!(
+                "Invalid window frame: frame offsets for RANGE must be either a numeric value, a string value or an interval"
+            )?,
+        }))),
+    }
+}
+
+impl fmt::Display for WindowFrameBound {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
-            WindowFrameBound::Preceding(None) => (0, 0),
-            WindowFrameBound::Following(None) => (4, 0),
-            WindowFrameBound::Preceding(Some(0))
-            | WindowFrameBound::CurrentRow
-            | WindowFrameBound::Following(Some(0)) => (2, 0),
-            WindowFrameBound::Preceding(Some(v)) => (1, u64::MAX - *v),
-            WindowFrameBound::Following(Some(v)) => (3, *v),
+            WindowFrameBound::Preceding(n) => {
+                if n.is_null() {
+                    f.write_str("UNBOUNDED PRECEDING")
+                } else {
+                    write!(f, "{n} PRECEDING")
+                }
+            }
+            WindowFrameBound::CurrentRow => f.write_str("CURRENT ROW"),
+            WindowFrameBound::Following(n) => {
+                if n.is_null() {
+                    f.write_str("UNBOUNDED FOLLOWING")
+                } else {
+                    write!(f, "{n} FOLLOWING")
+                }
+            }
         }
     }
 }
@@ -236,7 +474,7 @@ pub enum WindowFrameUnits {
 }
 
 impl fmt::Display for WindowFrameUnits {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         f.write_str(match self {
             WindowFrameUnits::Rows => "ROWS",
             WindowFrameUnits::Range => "RANGE",
@@ -245,6 +483,7 @@ impl fmt::Display for WindowFrameUnits {
     }
 }
 
+#[cfg(feature = "sql")]
 impl From<ast::WindowFrameUnits> for WindowFrameUnits {
     fn from(value: ast::WindowFrameUnits) -> Self {
         match value {
@@ -266,116 +505,124 @@ mod tests {
             start_bound: ast::WindowFrameBound::Following(None),
             end_bound: None,
         };
-        let result = WindowFrame::try_from(window_frame);
+        let err = WindowFrame::try_from(window_frame).unwrap_err();
         assert_eq!(
-      result.err().unwrap().to_string(),
-      "Execution error: Invalid window frame: start bound cannot be unbounded following"
-        .to_owned()
-    );
+            err.strip_backtrace(),
+            "Error during planning: Invalid window frame: start bound cannot be UNBOUNDED FOLLOWING".to_owned()
+        );
 
         let window_frame = ast::WindowFrame {
             units: ast::WindowFrameUnits::Range,
             start_bound: ast::WindowFrameBound::Preceding(None),
             end_bound: Some(ast::WindowFrameBound::Preceding(None)),
         };
-        let result = WindowFrame::try_from(window_frame);
+        let err = WindowFrame::try_from(window_frame).unwrap_err();
         assert_eq!(
-      result.err().unwrap().to_string(),
-      "Execution error: Invalid window frame: end bound cannot be unbounded preceding"
-        .to_owned()
-    );
-
-        let window_frame = ast::WindowFrame {
-            units: ast::WindowFrameUnits::Range,
-            start_bound: ast::WindowFrameBound::Preceding(Some(1)),
-            end_bound: Some(ast::WindowFrameBound::Preceding(Some(2))),
-        };
-        let result = WindowFrame::try_from(window_frame);
-        assert_eq!(
-            result.err().unwrap().to_string(),
-            "Execution error: Invalid window frame: start bound (1 PRECEDING) cannot be larger than end bound (2 PRECEDING)".to_owned()
-        );
-
-        let window_frame = ast::WindowFrame {
-            units: ast::WindowFrameUnits::Range,
-            start_bound: ast::WindowFrameBound::Preceding(Some(2)),
-            end_bound: Some(ast::WindowFrameBound::Preceding(Some(1))),
-        };
-        let result = WindowFrame::try_from(window_frame);
-        assert_eq!(
-            result.err().unwrap().to_string(),
-            "This feature is not implemented: With WindowFrameUnits=RANGE, the bound cannot be 2 PRECEDING or FOLLOWING at the moment".to_owned()
+            err.strip_backtrace(),
+            "Error during planning: Invalid window frame: end bound cannot be UNBOUNDED PRECEDING".to_owned()
         );
 
         let window_frame = ast::WindowFrame {
             units: ast::WindowFrameUnits::Rows,
-            start_bound: ast::WindowFrameBound::Preceding(Some(2)),
-            end_bound: Some(ast::WindowFrameBound::Preceding(Some(1))),
+            start_bound: ast::WindowFrameBound::Preceding(Some(Box::new(
+                ast::Expr::value(ast::Value::Number("2".to_string(), false)),
+            ))),
+            end_bound: Some(ast::WindowFrameBound::Preceding(Some(Box::new(
+                ast::Expr::value(ast::Value::Number("1".to_string(), false)),
+            )))),
         };
-        let result = WindowFrame::try_from(window_frame);
-        assert!(result.is_ok());
+
+        let window_frame = WindowFrame::try_from(window_frame)?;
+        assert_eq!(window_frame.units, WindowFrameUnits::Rows);
+        assert_eq!(
+            window_frame.start_bound,
+            WindowFrameBound::Preceding(ScalarValue::UInt64(Some(2)))
+        );
+        assert_eq!(
+            window_frame.end_bound,
+            WindowFrameBound::Preceding(ScalarValue::UInt64(Some(1)))
+        );
+
         Ok(())
     }
 
-    #[test]
-    fn test_eq() {
-        assert_eq!(
-            WindowFrameBound::Preceding(Some(0)),
-            WindowFrameBound::CurrentRow
-        );
-        assert_eq!(
-            WindowFrameBound::CurrentRow,
-            WindowFrameBound::Following(Some(0))
-        );
-        assert_eq!(
-            WindowFrameBound::Following(Some(2)),
-            WindowFrameBound::Following(Some(2))
-        );
-        assert_eq!(
-            WindowFrameBound::Following(None),
-            WindowFrameBound::Following(None)
-        );
-        assert_eq!(
-            WindowFrameBound::Preceding(Some(2)),
-            WindowFrameBound::Preceding(Some(2))
-        );
-        assert_eq!(
-            WindowFrameBound::Preceding(None),
-            WindowFrameBound::Preceding(None)
-        );
+    macro_rules! test_bound {
+        ($unit:ident, $value:expr, $expected:expr) => {
+            let preceding = WindowFrameBound::try_parse(
+                ast::WindowFrameBound::Preceding($value),
+                &ast::WindowFrameUnits::$unit,
+            )?;
+            assert_eq!(preceding, WindowFrameBound::Preceding($expected));
+            let following = WindowFrameBound::try_parse(
+                ast::WindowFrameBound::Following($value),
+                &ast::WindowFrameUnits::$unit,
+            )?;
+            assert_eq!(following, WindowFrameBound::Following($expected));
+        };
+    }
+
+    macro_rules! test_bound_err {
+        ($unit:ident, $value:expr, $expected:expr) => {
+            let err = WindowFrameBound::try_parse(
+                ast::WindowFrameBound::Preceding($value),
+                &ast::WindowFrameUnits::$unit,
+            )
+            .unwrap_err();
+            assert_eq!(err.strip_backtrace(), $expected);
+            let err = WindowFrameBound::try_parse(
+                ast::WindowFrameBound::Following($value),
+                &ast::WindowFrameUnits::$unit,
+            )
+            .unwrap_err();
+            assert_eq!(err.strip_backtrace(), $expected);
+        };
     }
 
     #[test]
-    fn test_ord() {
-        assert!(WindowFrameBound::Preceding(Some(1)) < WindowFrameBound::CurrentRow);
-        // ! yes this is correct!
-        assert!(
-            WindowFrameBound::Preceding(Some(2)) < WindowFrameBound::Preceding(Some(1))
+    fn test_window_frame_bound_creation() -> Result<()> {
+        //  Unbounded
+        test_bound!(Rows, None, ScalarValue::UInt64(None));
+        test_bound!(Groups, None, ScalarValue::UInt64(None));
+        test_bound!(Range, None, ScalarValue::UInt64(None));
+
+        // Number
+        let number = Some(Box::new(ast::Expr::Value(
+            ast::Value::Number("42".to_string(), false).into(),
+        )));
+        test_bound!(Rows, number.clone(), ScalarValue::UInt64(Some(42)));
+        test_bound!(Groups, number.clone(), ScalarValue::UInt64(Some(42)));
+        test_bound!(
+            Range,
+            number.clone(),
+            ScalarValue::Utf8(Some("42".to_string()))
         );
-        assert!(
-            WindowFrameBound::Preceding(Some(u64::MAX))
-                < WindowFrameBound::Preceding(Some(u64::MAX - 1))
+
+        // Interval
+        let number = Some(Box::new(ast::Expr::Interval(ast::Interval {
+            value: Box::new(ast::Expr::Value(
+                ast::Value::SingleQuotedString("1".to_string()).into(),
+            )),
+            leading_field: Some(ast::DateTimeField::Day),
+            fractional_seconds_precision: None,
+            last_field: None,
+            leading_precision: None,
+        })));
+        test_bound_err!(
+            Rows,
+            number.clone(),
+            "Error during planning: Invalid window frame: frame offsets for ROWS / GROUPS must be non negative integers"
         );
-        assert!(
-            WindowFrameBound::Preceding(None)
-                < WindowFrameBound::Preceding(Some(1000000))
+        test_bound_err!(
+            Groups,
+            number.clone(),
+            "Error during planning: Invalid window frame: frame offsets for ROWS / GROUPS must be non negative integers"
         );
-        assert!(
-            WindowFrameBound::Preceding(None)
-                < WindowFrameBound::Preceding(Some(u64::MAX))
+        test_bound!(
+            Range,
+            number.clone(),
+            ScalarValue::Utf8(Some("1 DAY".to_string()))
         );
-        assert!(WindowFrameBound::Preceding(None) < WindowFrameBound::Following(Some(0)));
-        assert!(
-            WindowFrameBound::Preceding(Some(1)) < WindowFrameBound::Following(Some(1))
-        );
-        assert!(WindowFrameBound::CurrentRow < WindowFrameBound::Following(Some(1)));
-        assert!(
-            WindowFrameBound::Following(Some(1)) < WindowFrameBound::Following(Some(2))
-        );
-        assert!(WindowFrameBound::Following(Some(2)) < WindowFrameBound::Following(None));
-        assert!(
-            WindowFrameBound::Following(Some(u64::MAX))
-                < WindowFrameBound::Following(None)
-        );
+
+        Ok(())
     }
 }

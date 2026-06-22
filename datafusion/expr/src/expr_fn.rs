@@ -17,223 +17,298 @@
 
 //! Functions for creating logical expressions
 
-use crate::expr::GroupingSet;
-use crate::{
-    aggregate_function, built_in_function, conditional_expressions::CaseBuilder, lit,
-    logical_plan::Subquery, AccumulatorFunctionImplementation, AggregateUDF,
-    BuiltinScalarFunction, Expr, LogicalPlan, Operator, ReturnTypeFunction,
-    ScalarFunctionImplementation, ScalarUDF, Signature, StateTypeFunction, Volatility,
+use crate::expr::{
+    AggregateFunction, BinaryExpr, Cast, Exists, GroupingSet, InList, InSubquery, Lambda,
+    LambdaVariable, NullTreatment, Placeholder, TryCast, Unnest, WildcardOptions,
+    WindowFunction,
 };
-use arrow::datatypes::DataType;
-use datafusion_common::Result;
+use crate::function::{
+    AccumulatorArgs, AccumulatorFactoryFunction, PartitionEvaluatorFactory,
+    StateFieldsArgs,
+};
+use crate::ptr_eq::PtrEq;
+use crate::select_expr::SelectExpr;
+use crate::{
+    AggregateUDF, Expr, LimitEffect, LogicalPlan, Operator, PartitionEvaluator,
+    ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, Signature, Volatility,
+    conditional_expressions::CaseBuilder, expr::Sort, logical_plan::Subquery,
+};
+use crate::{
+    AggregateUDFImpl, ColumnarValue, ScalarUDFImpl, WindowFrame, WindowUDF, WindowUDFImpl,
+};
+use arrow::compute::kernels::cast_utils::{
+    parse_interval_day_time, parse_interval_month_day_nano, parse_interval_year_month,
+};
+use arrow::datatypes::{DataType, Field, FieldRef};
+use datafusion_common::{Column, Result, ScalarValue, Spans, TableReference, plan_err};
+use datafusion_functions_window_common::field::WindowUDFFieldArgs;
+use datafusion_functions_window_common::partition::PartitionEvaluatorArgs;
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::hash::Hash;
+use std::ops::Not;
 use std::sync::Arc;
 
-/// Create a column expression based on a qualified or unqualified column name
-pub fn col(ident: &str) -> Expr {
+/// Create a column expression based on a qualified or unqualified column name. Will
+/// normalize unquoted identifiers according to SQL rules (identifiers will become lowercase).
+///
+/// For example:
+///
+/// ```rust
+/// # use datafusion_expr::col;
+/// let c1 = col("a");
+/// let c2 = col("A");
+/// assert_eq!(c1, c2);
+///
+/// // note how quoting with double quotes preserves the case
+/// let c3 = col(r#""A""#);
+/// assert_ne!(c1, c3);
+/// ```
+pub fn col(ident: impl Into<Column>) -> Expr {
     Expr::Column(ident.into())
 }
 
-/// Return a new expression l <op> r
-pub fn binary_expr(l: Expr, op: Operator, r: Expr) -> Expr {
-    Expr::BinaryExpr {
-        left: Box::new(l),
-        op,
-        right: Box::new(r),
-    }
+/// Create an out reference column which hold a reference that has been resolved to a field
+/// outside of the current plan.
+/// The expression created by this function does not preserve the metadata of the outer column.
+/// Please use `out_ref_col_with_metadata` if you want to preserve the metadata.
+pub fn out_ref_col(dt: DataType, ident: impl Into<Column>) -> Expr {
+    out_ref_col_with_metadata(dt, HashMap::new(), ident)
+}
+
+/// Create an out reference column from an existing field (preserving metadata)
+pub fn out_ref_col_with_metadata(
+    dt: DataType,
+    metadata: HashMap<String, String>,
+    ident: impl Into<Column>,
+) -> Expr {
+    let column = ident.into();
+    let field: FieldRef =
+        Arc::new(Field::new(column.name(), dt, true).with_metadata(metadata));
+    Expr::OuterReferenceColumn(field, column)
+}
+
+/// Create an unqualified column expression from the provided name, without normalizing
+/// the column.
+///
+/// For example:
+///
+/// ```rust
+/// # use datafusion_expr::{col, ident};
+/// let c1 = ident("A"); // not normalized staying as column 'A'
+/// let c2 = col("A"); // normalized via SQL rules becoming column 'a'
+/// assert_ne!(c1, c2);
+///
+/// let c3 = col(r#""A""#);
+/// assert_eq!(c1, c3);
+///
+/// let c4 = col("t1.a"); // parses as relation 't1' column 'a'
+/// let c5 = ident("t1.a"); // parses as column 't1.a'
+/// assert_ne!(c4, c5);
+/// ```
+pub fn ident(name: impl Into<String>) -> Expr {
+    Expr::Column(Column::from_name(name))
+}
+
+/// Create placeholder value that will be filled in (such as `$1`)
+///
+/// Note the parameter type can be inferred using [`Expr::infer_placeholder_types`]
+///
+/// # Example
+///
+/// ```rust
+/// # use datafusion_expr::{placeholder};
+/// let p = placeholder("$1"); // $1, refers to parameter 1
+/// assert_eq!(p.to_string(), "$1")
+/// ```
+pub fn placeholder(id: impl Into<String>) -> Expr {
+    Expr::Placeholder(Placeholder {
+        id: id.into(),
+        field: None,
+    })
+}
+
+/// Create an '*' [`Expr::Wildcard`] expression that matches all columns
+///
+/// # Example
+///
+/// ```rust
+/// # use datafusion_expr::{wildcard};
+/// let p = wildcard();
+/// assert_eq!(p.to_string(), "*")
+/// ```
+pub fn wildcard() -> SelectExpr {
+    SelectExpr::Wildcard(WildcardOptions::default())
+}
+
+/// Create an '*' [`Expr::Wildcard`] expression with the wildcard options
+pub fn wildcard_with_options(options: WildcardOptions) -> SelectExpr {
+    SelectExpr::Wildcard(options)
+}
+
+/// Create an 't.*' [`Expr::Wildcard`] expression that matches all columns from a specific table
+///
+/// # Example
+///
+/// ```rust
+/// # use datafusion_common::TableReference;
+/// # use datafusion_expr::{qualified_wildcard};
+/// let p = qualified_wildcard(TableReference::bare("t"));
+/// assert_eq!(p.to_string(), "t.*")
+/// ```
+pub fn qualified_wildcard(qualifier: impl Into<TableReference>) -> SelectExpr {
+    SelectExpr::QualifiedWildcard(qualifier.into(), WildcardOptions::default())
+}
+
+/// Create an 't.*' [`Expr::Wildcard`] expression with the wildcard options
+pub fn qualified_wildcard_with_options(
+    qualifier: impl Into<TableReference>,
+    options: WildcardOptions,
+) -> SelectExpr {
+    SelectExpr::QualifiedWildcard(qualifier.into(), options)
+}
+
+/// Return a new expression `left <op> right`
+pub fn binary_expr(left: Expr, op: Operator, right: Expr) -> Expr {
+    Expr::BinaryExpr(BinaryExpr::new(Box::new(left), op, Box::new(right)))
 }
 
 /// Return a new expression with a logical AND
 pub fn and(left: Expr, right: Expr) -> Expr {
-    Expr::BinaryExpr {
-        left: Box::new(left),
-        op: Operator::And,
-        right: Box::new(right),
-    }
+    Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(left),
+        Operator::And,
+        Box::new(right),
+    ))
 }
 
 /// Return a new expression with a logical OR
 pub fn or(left: Expr, right: Expr) -> Expr {
-    Expr::BinaryExpr {
-        left: Box::new(left),
-        op: Operator::Or,
-        right: Box::new(right),
-    }
+    Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(left),
+        Operator::Or,
+        Box::new(right),
+    ))
 }
 
-/// Create an expression to represent the min() aggregate function
-pub fn min(expr: Expr) -> Expr {
-    Expr::AggregateFunction {
-        fun: aggregate_function::AggregateFunction::Min,
-        distinct: false,
-        args: vec![expr],
-    }
+/// Return a new expression with a logical NOT
+pub fn not(expr: Expr) -> Expr {
+    expr.not()
 }
 
-/// Create an expression to represent the max() aggregate function
-pub fn max(expr: Expr) -> Expr {
-    Expr::AggregateFunction {
-        fun: aggregate_function::AggregateFunction::Max,
-        distinct: false,
-        args: vec![expr],
-    }
+/// Return a new expression with bitwise AND
+pub fn bitwise_and(left: Expr, right: Expr) -> Expr {
+    Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(left),
+        Operator::BitwiseAnd,
+        Box::new(right),
+    ))
 }
 
-/// Create an expression to represent the sum() aggregate function
-pub fn sum(expr: Expr) -> Expr {
-    Expr::AggregateFunction {
-        fun: aggregate_function::AggregateFunction::Sum,
-        distinct: false,
-        args: vec![expr],
-    }
+/// Return a new expression with bitwise OR
+pub fn bitwise_or(left: Expr, right: Expr) -> Expr {
+    Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(left),
+        Operator::BitwiseOr,
+        Box::new(right),
+    ))
 }
 
-/// Create an expression to represent the avg() aggregate function
-pub fn avg(expr: Expr) -> Expr {
-    Expr::AggregateFunction {
-        fun: aggregate_function::AggregateFunction::Avg,
-        distinct: false,
-        args: vec![expr],
-    }
+/// Return a new expression with bitwise XOR
+pub fn bitwise_xor(left: Expr, right: Expr) -> Expr {
+    Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(left),
+        Operator::BitwiseXor,
+        Box::new(right),
+    ))
 }
 
-/// Create an expression to represent the count() aggregate function
-pub fn count(expr: Expr) -> Expr {
-    Expr::AggregateFunction {
-        fun: aggregate_function::AggregateFunction::Count,
-        distinct: false,
-        args: vec![expr],
-    }
+/// Return a new expression with bitwise SHIFT RIGHT
+pub fn bitwise_shift_right(left: Expr, right: Expr) -> Expr {
+    Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(left),
+        Operator::BitwiseShiftRight,
+        Box::new(right),
+    ))
 }
 
-/// Create an expression to represent the count(distinct) aggregate function
-pub fn count_distinct(expr: Expr) -> Expr {
-    Expr::AggregateFunction {
-        fun: aggregate_function::AggregateFunction::Count,
-        distinct: true,
-        args: vec![expr],
-    }
+/// Return a new expression with bitwise SHIFT LEFT
+pub fn bitwise_shift_left(left: Expr, right: Expr) -> Expr {
+    Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(left),
+        Operator::BitwiseShiftLeft,
+        Box::new(right),
+    ))
 }
 
 /// Create an in_list expression
 pub fn in_list(expr: Expr, list: Vec<Expr>, negated: bool) -> Expr {
-    Expr::InList {
-        expr: Box::new(expr),
-        list,
-        negated,
-    }
-}
-
-/// Concatenates the text representations of all the arguments. NULL arguments are ignored.
-pub fn concat(args: &[Expr]) -> Expr {
-    Expr::ScalarFunction {
-        fun: built_in_function::BuiltinScalarFunction::Concat,
-        args: args.to_vec(),
-    }
-}
-
-/// Concatenates all but the first argument, with separators.
-/// The first argument is used as the separator string, and should not be NULL.
-/// Other NULL arguments are ignored.
-pub fn concat_ws(sep: impl Into<String>, values: &[Expr]) -> Expr {
-    let mut args = vec![lit(sep.into())];
-    args.extend_from_slice(values);
-    Expr::ScalarFunction {
-        fun: built_in_function::BuiltinScalarFunction::ConcatWithSeparator,
-        args,
-    }
-}
-
-/// Returns a random value in the range 0.0 <= x < 1.0
-pub fn random() -> Expr {
-    Expr::ScalarFunction {
-        fun: built_in_function::BuiltinScalarFunction::Random,
-        args: vec![],
-    }
-}
-
-/// Returns the approximate number of distinct input values.
-/// This function provides an approximation of count(DISTINCT x).
-/// Zero is returned if all input values are null.
-/// This function should produce a standard error of 0.81%,
-/// which is the standard deviation of the (approximately normal)
-/// error distribution over all possible sets.
-/// It does not guarantee an upper bound on the error for any specific input set.
-pub fn approx_distinct(expr: Expr) -> Expr {
-    Expr::AggregateFunction {
-        fun: aggregate_function::AggregateFunction::ApproxDistinct,
-        distinct: false,
-        args: vec![expr],
-    }
-}
-
-/// Calculate an approximation of the median for `expr`.
-pub fn approx_median(expr: Expr) -> Expr {
-    Expr::AggregateFunction {
-        fun: aggregate_function::AggregateFunction::ApproxMedian,
-        distinct: false,
-        args: vec![expr],
-    }
-}
-
-/// Calculate an approximation of the specified `percentile` for `expr`.
-pub fn approx_percentile_cont(expr: Expr, percentile: Expr) -> Expr {
-    Expr::AggregateFunction {
-        fun: aggregate_function::AggregateFunction::ApproxPercentileCont,
-        distinct: false,
-        args: vec![expr, percentile],
-    }
-}
-
-/// Calculate an approximation of the specified `percentile` for `expr` and `weight_expr`.
-pub fn approx_percentile_cont_with_weight(
-    expr: Expr,
-    weight_expr: Expr,
-    percentile: Expr,
-) -> Expr {
-    Expr::AggregateFunction {
-        fun: aggregate_function::AggregateFunction::ApproxPercentileContWithWeight,
-        distinct: false,
-        args: vec![expr, weight_expr, percentile],
-    }
+    Expr::InList(InList::new(Box::new(expr), list, negated))
 }
 
 /// Create an EXISTS subquery expression
 pub fn exists(subquery: Arc<LogicalPlan>) -> Expr {
-    Expr::Exists {
-        subquery: Subquery { subquery },
+    let outer_ref_columns = subquery.all_out_ref_exprs();
+    Expr::Exists(Exists {
+        subquery: Subquery {
+            subquery,
+            outer_ref_columns,
+            spans: Spans::new(),
+        },
         negated: false,
-    }
+    })
 }
 
 /// Create a NOT EXISTS subquery expression
 pub fn not_exists(subquery: Arc<LogicalPlan>) -> Expr {
-    Expr::Exists {
-        subquery: Subquery { subquery },
+    let outer_ref_columns = subquery.all_out_ref_exprs();
+    Expr::Exists(Exists {
+        subquery: Subquery {
+            subquery,
+            outer_ref_columns,
+            spans: Spans::new(),
+        },
         negated: true,
-    }
+    })
 }
 
 /// Create an IN subquery expression
 pub fn in_subquery(expr: Expr, subquery: Arc<LogicalPlan>) -> Expr {
-    Expr::InSubquery {
-        expr: Box::new(expr),
-        subquery: Subquery { subquery },
-        negated: false,
-    }
+    let outer_ref_columns = subquery.all_out_ref_exprs();
+    Expr::InSubquery(InSubquery::new(
+        Box::new(expr),
+        Subquery {
+            subquery,
+            outer_ref_columns,
+            spans: Spans::new(),
+        },
+        false,
+    ))
 }
 
 /// Create a NOT IN subquery expression
 pub fn not_in_subquery(expr: Expr, subquery: Arc<LogicalPlan>) -> Expr {
-    Expr::InSubquery {
-        expr: Box::new(expr),
-        subquery: Subquery { subquery },
-        negated: true,
-    }
+    let outer_ref_columns = subquery.all_out_ref_exprs();
+    Expr::InSubquery(InSubquery::new(
+        Box::new(expr),
+        Subquery {
+            subquery,
+            outer_ref_columns,
+            spans: Spans::new(),
+        },
+        true,
+    ))
 }
 
 /// Create a scalar subquery expression
 pub fn scalar_subquery(subquery: Arc<LogicalPlan>) -> Expr {
-    Expr::ScalarSubquery(Subquery { subquery })
+    let outer_ref_columns = subquery.all_out_ref_exprs();
+    Expr::ScalarSubquery(Subquery {
+        subquery,
+        outer_ref_columns,
+        spans: Spans::new(),
+    })
 }
 
 /// Create a grouping set
@@ -253,147 +328,52 @@ pub fn rollup(exprs: Vec<Expr>) -> Expr {
 
 /// Create a cast expression
 pub fn cast(expr: Expr, data_type: DataType) -> Expr {
-    Expr::Cast {
-        expr: Box::new(expr),
-        data_type,
-    }
+    Expr::Cast(Cast::new(Box::new(expr), data_type))
 }
 
-/// Create an convenience function representing a unary scalar function
-macro_rules! unary_scalar_expr {
-    ($ENUM:ident, $FUNC:ident, $DOC:expr) => {
-        #[doc = $DOC ]
-        pub fn $FUNC(e: Expr) -> Expr {
-            Expr::ScalarFunction {
-                fun: built_in_function::BuiltinScalarFunction::$ENUM,
-                args: vec![e],
-            }
-        }
-    };
+/// Create a try cast expression
+pub fn try_cast(expr: Expr, data_type: DataType) -> Expr {
+    Expr::TryCast(TryCast::new(Box::new(expr), data_type))
 }
 
-macro_rules! scalar_expr {
-    ($ENUM:ident, $FUNC:ident, $($arg:ident),*) => {
-        #[doc = concat!("Scalar function definition for ", stringify!($FUNC) ) ]
-        pub fn $FUNC($($arg: Expr),*) -> Expr {
-            Expr::ScalarFunction {
-                fun: built_in_function::BuiltinScalarFunction::$ENUM,
-                args: vec![$($arg),*],
-            }
-        }
-    };
+/// Create is null expression
+pub fn is_null(expr: Expr) -> Expr {
+    Expr::IsNull(Box::new(expr))
 }
 
-macro_rules! nary_scalar_expr {
-    ($ENUM:ident, $FUNC:ident) => {
-        #[doc = concat!("Scalar function definition for ", stringify!($FUNC) ) ]
-        pub fn $FUNC(args: Vec<Expr>) -> Expr {
-            Expr::ScalarFunction {
-                fun: built_in_function::BuiltinScalarFunction::$ENUM,
-                args,
-            }
-        }
-    };
+/// Create is not null expression
+pub fn is_not_null(expr: Expr) -> Expr {
+    Expr::IsNotNull(Box::new(expr))
 }
 
-// generate methods for creating the supported unary/binary expressions
-
-// math functions
-unary_scalar_expr!(Sqrt, sqrt, "square root of a number");
-unary_scalar_expr!(Sin, sin, "sine");
-unary_scalar_expr!(Cos, cos, "cosine");
-unary_scalar_expr!(Tan, tan, "tangent");
-unary_scalar_expr!(Asin, asin, "inverse sine");
-unary_scalar_expr!(Acos, acos, "inverse cosine");
-unary_scalar_expr!(Atan, atan, "inverse tangent");
-unary_scalar_expr!(
-    Floor,
-    floor,
-    "nearest integer less than or equal to argument"
-);
-unary_scalar_expr!(
-    Ceil,
-    ceil,
-    "nearest integer greater than or equal to argument"
-);
-unary_scalar_expr!(Round, round, "round to nearest integer");
-unary_scalar_expr!(Trunc, trunc, "truncate toward zero");
-unary_scalar_expr!(Abs, abs, "absolute value");
-unary_scalar_expr!(Signum, signum, "sign of the argument (-1, 0, +1) ");
-unary_scalar_expr!(Exp, exp, "base 2 logarithm");
-unary_scalar_expr!(Log2, log2, "base 10 logarithm");
-unary_scalar_expr!(Log10, log10, "base 10 logarithm");
-unary_scalar_expr!(Ln, ln, "natural logarithm");
-unary_scalar_expr!(NullIf, nullif, "The NULLIF function returns a null value if value1 equals value2; otherwise it returns value1. This can be used to perform the inverse operation of the COALESCE expression."); //TODO this is not a unary expression https://github.com/apache/arrow-datafusion/issues/3069
-scalar_expr!(Power, power, base, exponent);
-scalar_expr!(Atan2, atan2, y, x);
-
-// string functions
-scalar_expr!(Ascii, ascii, string);
-scalar_expr!(BitLength, bit_length, string);
-scalar_expr!(CharacterLength, character_length, string);
-scalar_expr!(CharacterLength, length, string);
-scalar_expr!(Chr, chr, string);
-scalar_expr!(Digest, digest, string, algorithm);
-scalar_expr!(InitCap, initcap, string);
-scalar_expr!(Left, left, string, count);
-scalar_expr!(Lower, lower, string);
-scalar_expr!(Ltrim, ltrim, string);
-scalar_expr!(MD5, md5, string);
-scalar_expr!(OctetLength, octet_length, string);
-scalar_expr!(Replace, replace, string, from, to);
-scalar_expr!(Repeat, repeat, string, count);
-scalar_expr!(Reverse, reverse, string);
-scalar_expr!(Right, right, string, count);
-scalar_expr!(Rtrim, rtrim, string);
-scalar_expr!(SHA224, sha224, string);
-scalar_expr!(SHA256, sha256, string);
-scalar_expr!(SHA384, sha384, string);
-scalar_expr!(SHA512, sha512, string);
-scalar_expr!(SplitPart, split_part, expr, delimiter, index);
-scalar_expr!(StartsWith, starts_with, string, characters);
-scalar_expr!(Strpos, strpos, string, substring);
-scalar_expr!(Substr, substr, string, position);
-scalar_expr!(ToHex, to_hex, string);
-scalar_expr!(Translate, translate, string, from, to);
-scalar_expr!(Trim, trim, string);
-scalar_expr!(Upper, upper, string);
-//use vec as parameter
-nary_scalar_expr!(Lpad, lpad);
-nary_scalar_expr!(Rpad, rpad);
-nary_scalar_expr!(RegexpReplace, regexp_replace);
-nary_scalar_expr!(RegexpMatch, regexp_match);
-nary_scalar_expr!(Btrim, btrim);
-//there is a func concat_ws before, so use concat_ws_expr as name.c
-nary_scalar_expr!(ConcatWithSeparator, concat_ws_expr);
-nary_scalar_expr!(Concat, concat_expr);
-nary_scalar_expr!(Now, now_expr);
-
-// date functions
-unary_scalar_expr!(Now, now, "current time"); //TODO this is not a unary expression https://github.com/apache/arrow-datafusion/issues/3069
-scalar_expr!(DatePart, date_part, part, date);
-scalar_expr!(DateTrunc, date_trunc, part, date);
-scalar_expr!(DateBin, date_bin, stride, source, origin);
-scalar_expr!(ToTimestampMillis, to_timestamp_millis, date);
-scalar_expr!(ToTimestampMicros, to_timestamp_micros, date);
-scalar_expr!(ToTimestampSeconds, to_timestamp_seconds, date);
-scalar_expr!(FromUnixtime, from_unixtime, unixtime);
-
-/// Returns an array of fixed size with each argument on it.
-pub fn array(args: Vec<Expr>) -> Expr {
-    Expr::ScalarFunction {
-        fun: built_in_function::BuiltinScalarFunction::Array,
-        args,
-    }
+/// Create is true expression
+pub fn is_true(expr: Expr) -> Expr {
+    Expr::IsTrue(Box::new(expr))
 }
 
-/// Returns `coalesce(args...)`, which evaluates to the value of the first [Expr]
-/// which is not NULL
-pub fn coalesce(args: Vec<Expr>) -> Expr {
-    Expr::ScalarFunction {
-        fun: built_in_function::BuiltinScalarFunction::Coalesce,
-        args,
-    }
+/// Create is not true expression
+pub fn is_not_true(expr: Expr) -> Expr {
+    Expr::IsNotTrue(Box::new(expr))
+}
+
+/// Create is false expression
+pub fn is_false(expr: Expr) -> Expr {
+    Expr::IsFalse(Box::new(expr))
+}
+
+/// Create is not false expression
+pub fn is_not_false(expr: Expr) -> Expr {
+    Expr::IsNotFalse(Box::new(expr))
+}
+
+/// Create is unknown expression
+pub fn is_unknown(expr: Expr) -> Expr {
+    Expr::IsUnknown(Box::new(expr))
+}
+
+/// Create is not unknown expression
+pub fn is_not_unknown(expr: Expr) -> Expr {
+    Expr::IsNotUnknown(Box::new(expr))
 }
 
 /// Create a CASE WHEN statement with literal WHEN expressions for comparison to the base expression.
@@ -406,83 +386,616 @@ pub fn when(when: Expr, then: Expr) -> CaseBuilder {
     CaseBuilder::new(None, vec![when], vec![then], None)
 }
 
-/// Combines an array of filter expressions into a single filter expression
-/// consisting of the input filter expressions joined with logical AND.
-/// Returns None if the filters array is empty.
-pub fn combine_filters(filters: &[Expr]) -> Option<Expr> {
-    if filters.is_empty() {
-        return None;
-    }
-    let combined_filter = filters
-        .iter()
-        .skip(1)
-        .fold(filters[0].clone(), |acc, filter| and(acc, filter.clone()));
-    Some(combined_filter)
+/// Create a Unnest expression
+pub fn unnest(expr: Expr) -> Expr {
+    Expr::Unnest(Unnest {
+        expr: Box::new(expr),
+    })
 }
 
-/// Recursively un-alias an expressions
-#[inline]
-pub fn unalias(expr: Expr) -> Expr {
-    match expr {
-        Expr::Alias(sub_expr, _) => unalias(*sub_expr),
-        _ => expr,
-    }
-}
-
-/// Creates a new UDF with a specific signature and specific return type.
-/// This is a helper function to create a new UDF.
-/// The function `create_udf` returns a subset of all possible `ScalarFunction`:
-/// * the UDF has a fixed return type
-/// * the UDF has a fixed signature (e.g. [f64, f64])
+/// Convenience method to create a new user defined scalar function (UDF) with a
+/// specific signature and specific return type.
+///
+/// Note this function does not expose all available features of [`ScalarUDF`],
+/// such as
+///
+/// * computing return types based on input types
+/// * multiple [`Signature`]s
+/// * aliases
+///
+/// See [`ScalarUDF`] for details and examples on how to use the full
+/// functionality.
 pub fn create_udf(
     name: &str,
     input_types: Vec<DataType>,
-    return_type: Arc<DataType>,
+    return_type: DataType,
     volatility: Volatility,
     fun: ScalarFunctionImplementation,
 ) -> ScalarUDF {
-    let return_type: ReturnTypeFunction = Arc::new(move |_| Ok(return_type.clone()));
-    ScalarUDF::new(
+    ScalarUDF::from(SimpleScalarUDF::new(
         name,
-        &Signature::exact(input_types, volatility),
-        &return_type,
-        &fun,
-    )
+        input_types,
+        return_type,
+        volatility,
+        fun,
+    ))
+}
+
+/// Implements [`ScalarUDFImpl`] for functions that have a single signature and
+/// return type.
+#[derive(PartialEq, Eq, Hash)]
+pub struct SimpleScalarUDF {
+    name: String,
+    signature: Signature,
+    return_type: DataType,
+    fun: PtrEq<ScalarFunctionImplementation>,
+}
+
+impl Debug for SimpleScalarUDF {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("SimpleScalarUDF")
+            .field("name", &self.name)
+            .field("signature", &self.signature)
+            .field("return_type", &self.return_type)
+            .field("fun", &"<FUNC>")
+            .finish()
+    }
+}
+
+impl SimpleScalarUDF {
+    /// Create a new `SimpleScalarUDF` from a name, input types, return type and
+    /// implementation. Implementing [`ScalarUDFImpl`] allows more flexibility
+    pub fn new(
+        name: impl Into<String>,
+        input_types: Vec<DataType>,
+        return_type: DataType,
+        volatility: Volatility,
+        fun: ScalarFunctionImplementation,
+    ) -> Self {
+        Self::new_with_signature(
+            name,
+            Signature::exact(input_types, volatility),
+            return_type,
+            fun,
+        )
+    }
+
+    /// Create a new `SimpleScalarUDF` from a name, signature, return type and
+    /// implementation. Implementing [`ScalarUDFImpl`] allows more flexibility
+    pub fn new_with_signature(
+        name: impl Into<String>,
+        signature: Signature,
+        return_type: DataType,
+        fun: ScalarFunctionImplementation,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            signature,
+            return_type,
+            fun: fun.into(),
+        }
+    }
+}
+
+impl ScalarUDFImpl for SimpleScalarUDF {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(self.return_type.clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        (self.fun)(&args.args)
+    }
 }
 
 /// Creates a new UDAF with a specific signature, state type and return type.
 /// The signature and state type must match the `Accumulator's implementation`.
-#[allow(clippy::rc_buffer)]
 pub fn create_udaf(
+    name: &str,
+    input_type: Vec<DataType>,
+    return_type: Arc<DataType>,
+    volatility: Volatility,
+    accumulator: AccumulatorFactoryFunction,
+    state_type: Arc<Vec<DataType>>,
+) -> AggregateUDF {
+    let return_type = Arc::unwrap_or_clone(return_type);
+    let state_type = Arc::unwrap_or_clone(state_type);
+    let state_fields = state_type
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| Field::new(format!("{i}"), t, true))
+        .map(Arc::new)
+        .collect::<Vec<_>>();
+    AggregateUDF::from(SimpleAggregateUDF::new(
+        name,
+        input_type,
+        return_type,
+        volatility,
+        accumulator,
+        state_fields,
+    ))
+}
+
+/// Implements [`AggregateUDFImpl`] for functions that have a single signature and
+/// return type.
+#[derive(PartialEq, Eq, Hash)]
+pub struct SimpleAggregateUDF {
+    name: String,
+    signature: Signature,
+    return_type: DataType,
+    accumulator: PtrEq<AccumulatorFactoryFunction>,
+    state_fields: Vec<FieldRef>,
+}
+
+impl Debug for SimpleAggregateUDF {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("SimpleAggregateUDF")
+            .field("name", &self.name)
+            .field("signature", &self.signature)
+            .field("return_type", &self.return_type)
+            .field("fun", &"<FUNC>")
+            .finish()
+    }
+}
+
+impl SimpleAggregateUDF {
+    /// Create a new `SimpleAggregateUDF` from a name, input types, return type, state type and
+    /// implementation. Implementing [`AggregateUDFImpl`] allows more flexibility
+    pub fn new(
+        name: impl Into<String>,
+        input_type: Vec<DataType>,
+        return_type: DataType,
+        volatility: Volatility,
+        accumulator: AccumulatorFactoryFunction,
+        state_fields: Vec<FieldRef>,
+    ) -> Self {
+        let name = name.into();
+        let signature = Signature::exact(input_type, volatility);
+        Self {
+            name,
+            signature,
+            return_type,
+            accumulator: accumulator.into(),
+            state_fields,
+        }
+    }
+
+    /// Create a new `SimpleAggregateUDF` from a name, signature, return type, state type and
+    /// implementation. Implementing [`AggregateUDFImpl`] allows more flexibility
+    pub fn new_with_signature(
+        name: impl Into<String>,
+        signature: Signature,
+        return_type: DataType,
+        accumulator: AccumulatorFactoryFunction,
+        state_fields: Vec<FieldRef>,
+    ) -> Self {
+        let name = name.into();
+        Self {
+            name,
+            signature,
+            return_type,
+            accumulator: accumulator.into(),
+            state_fields,
+        }
+    }
+}
+
+impl AggregateUDFImpl for SimpleAggregateUDF {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(self.return_type.clone())
+    }
+
+    fn accumulator(
+        &self,
+        acc_args: AccumulatorArgs,
+    ) -> Result<Box<dyn crate::Accumulator>> {
+        (self.accumulator)(acc_args)
+    }
+
+    fn state_fields(&self, _args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+        Ok(self.state_fields.clone())
+    }
+}
+
+/// Creates a new UDWF with a specific signature, state type and return type.
+///
+/// The signature and state type must match the [`PartitionEvaluator`]'s implementation`.
+///
+/// [`PartitionEvaluator`]: crate::PartitionEvaluator
+pub fn create_udwf(
     name: &str,
     input_type: DataType,
     return_type: Arc<DataType>,
     volatility: Volatility,
-    accumulator: AccumulatorFunctionImplementation,
-    state_type: Arc<Vec<DataType>>,
-) -> AggregateUDF {
-    let return_type: ReturnTypeFunction = Arc::new(move |_| Ok(return_type.clone()));
-    let state_type: StateTypeFunction = Arc::new(move |_| Ok(state_type.clone()));
-    AggregateUDF::new(
+    partition_evaluator_factory: PartitionEvaluatorFactory,
+) -> WindowUDF {
+    let return_type = Arc::unwrap_or_clone(return_type);
+    WindowUDF::from(SimpleWindowUDF::new(
         name,
-        &Signature::exact(vec![input_type], volatility),
-        &return_type,
-        &accumulator,
-        &state_type,
-    )
+        input_type,
+        return_type,
+        volatility,
+        partition_evaluator_factory,
+    ))
 }
 
-/// Calls a named built in function
-/// ```
-/// use datafusion_expr::{col, lit, call_fn};
+/// Implements [`WindowUDFImpl`] for functions that have a single signature and
+/// return type.
+#[derive(PartialEq, Eq, Hash)]
+pub struct SimpleWindowUDF {
+    name: String,
+    signature: Signature,
+    return_type: DataType,
+    partition_evaluator_factory: PtrEq<PartitionEvaluatorFactory>,
+}
+
+impl Debug for SimpleWindowUDF {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("WindowUDF")
+            .field("name", &self.name)
+            .field("signature", &self.signature)
+            .field("return_type", &"<func>")
+            .field("partition_evaluator_factory", &"<FUNC>")
+            .finish()
+    }
+}
+
+impl SimpleWindowUDF {
+    /// Create a new `SimpleWindowUDF` from a name, input types, return type and
+    /// implementation. Implementing [`WindowUDFImpl`] allows more flexibility
+    pub fn new(
+        name: impl Into<String>,
+        input_type: DataType,
+        return_type: DataType,
+        volatility: Volatility,
+        partition_evaluator_factory: PartitionEvaluatorFactory,
+    ) -> Self {
+        let name = name.into();
+        let signature = Signature::exact([input_type].to_vec(), volatility);
+        Self {
+            name,
+            signature,
+            return_type,
+            partition_evaluator_factory: partition_evaluator_factory.into(),
+        }
+    }
+}
+
+impl WindowUDFImpl for SimpleWindowUDF {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn partition_evaluator(
+        &self,
+        _partition_evaluator_args: PartitionEvaluatorArgs,
+    ) -> Result<Box<dyn PartitionEvaluator>> {
+        (self.partition_evaluator_factory)()
+    }
+
+    fn field(&self, field_args: WindowUDFFieldArgs) -> Result<FieldRef> {
+        Ok(Arc::new(Field::new(
+            field_args.name(),
+            self.return_type.clone(),
+            true,
+        )))
+    }
+
+    fn limit_effect(&self, _args: &[Arc<dyn PhysicalExpr>]) -> LimitEffect {
+        LimitEffect::Unknown
+    }
+}
+
+pub fn interval_year_month_lit(value: &str) -> Expr {
+    let interval = parse_interval_year_month(value).ok();
+    Expr::Literal(ScalarValue::IntervalYearMonth(interval), None)
+}
+
+pub fn interval_datetime_lit(value: &str) -> Expr {
+    let interval = parse_interval_day_time(value).ok();
+    Expr::Literal(ScalarValue::IntervalDayTime(interval), None)
+}
+
+pub fn interval_month_day_nano_lit(value: &str) -> Expr {
+    let interval = parse_interval_month_day_nano(value).ok();
+    Expr::Literal(ScalarValue::IntervalMonthDayNano(interval), None)
+}
+
+/// Create a lambda expression
+pub fn lambda(params: impl IntoIterator<Item = impl Into<String>>, body: Expr) -> Expr {
+    Expr::Lambda(Lambda::new(
+        params.into_iter().map(Into::into).collect(),
+        body,
+    ))
+}
+
+/// Create an unresolved lambda variable expression
 ///
-/// // create the expression sin(x) < 0.2
-/// let expr = call_fn("sin", vec![col("x")]).unwrap().lt(lit(0.2));
+/// The expression tree or [`LogicalPlan`] which
+/// owns this variable must be resolved before usage with either
+/// [`Expr::resolve_lambda_variables`] or [`LogicalPlan::resolve_lambda_variables`].
+///
+/// [LogicalPlan::resolve_lambda_variables]: crate::LogicalPlan::resolve_lambda_variables
+pub fn lambda_var(name: impl Into<String>) -> Expr {
+    Expr::LambdaVariable(LambdaVariable::new(name.into(), None))
+}
+
+/// Extensions for configuring [`Expr::AggregateFunction`] or [`Expr::WindowFunction`]
+///
+/// Adds methods to [`Expr`] that make it easy to set optional options
+/// such as `ORDER BY`, `FILTER` and `DISTINCT`
+///
+/// # Example
+/// ```no_run
+/// # use datafusion_common::Result;
+/// # use datafusion_expr::expr::NullTreatment;
+/// # use datafusion_expr::test::function_stub::count;
+/// # use datafusion_expr::{ExprFunctionExt, lit, Expr, col};
+/// # // first_value is an aggregate function in another crate
+/// # fn first_value(_arg: Expr) -> Expr {
+/// unimplemented!() }
+/// # fn main() -> Result<()> {
+/// // Create an aggregate count, filtering on column y > 5
+/// let agg = count(col("x")).filter(col("y").gt(lit(5))).build()?;
+///
+/// // Find the first value in an aggregate sorted by column y
+/// // equivalent to:
+/// // `FIRST_VALUE(x ORDER BY y ASC IGNORE NULLS)`
+/// let sort_expr = col("y").sort(true, true);
+/// let agg = first_value(col("x"))
+///     .order_by(vec![sort_expr])
+///     .null_treatment(NullTreatment::IgnoreNulls)
+///     .build()?;
+///
+/// // Create a window expression for percent rank partitioned on column a
+/// // equivalent to:
+/// // `PERCENT_RANK() OVER (PARTITION BY a ORDER BY b ASC NULLS LAST IGNORE NULLS)`
+/// // percent_rank is an udwf function in another crate
+/// # fn percent_rank() -> Expr {
+/// unimplemented!() }
+/// let window = percent_rank()
+///     .partition_by(vec![col("a")])
+///     .order_by(vec![col("b").sort(true, true)])
+///     .null_treatment(NullTreatment::IgnoreNulls)
+///     .build()?;
+/// #     Ok(())
+/// # }
 /// ```
-pub fn call_fn(name: impl AsRef<str>, args: Vec<Expr>) -> Result<Expr> {
-    match name.as_ref().parse::<BuiltinScalarFunction>() {
-        Ok(fun) => Ok(Expr::ScalarFunction { fun, args }),
-        Err(e) => Err(e),
+pub trait ExprFunctionExt {
+    /// Add `ORDER BY <order_by>`
+    fn order_by(self, order_by: Vec<Sort>) -> ExprFuncBuilder;
+    /// Add `FILTER <filter>`
+    fn filter(self, filter: Expr) -> ExprFuncBuilder;
+    /// Add `DISTINCT`
+    fn distinct(self) -> ExprFuncBuilder;
+    /// Add `RESPECT NULLS` or `IGNORE NULLS`
+    fn null_treatment(
+        self,
+        null_treatment: impl Into<Option<NullTreatment>>,
+    ) -> ExprFuncBuilder;
+    /// Add `PARTITION BY`
+    fn partition_by(self, partition_by: Vec<Expr>) -> ExprFuncBuilder;
+    /// Add appropriate window frame conditions
+    fn window_frame(self, window_frame: WindowFrame) -> ExprFuncBuilder;
+}
+
+#[derive(Debug, Clone)]
+pub enum ExprFuncKind {
+    Aggregate(AggregateFunction),
+    Window(Box<WindowFunction>),
+}
+
+/// Implementation of [`ExprFunctionExt`].
+///
+/// See [`ExprFunctionExt`] for usage and examples
+#[derive(Debug, Clone)]
+pub struct ExprFuncBuilder {
+    fun: Option<ExprFuncKind>,
+    order_by: Option<Vec<Sort>>,
+    filter: Option<Expr>,
+    distinct: bool,
+    null_treatment: Option<NullTreatment>,
+    partition_by: Option<Vec<Expr>>,
+    window_frame: Option<WindowFrame>,
+}
+
+impl ExprFuncBuilder {
+    /// Create a new `ExprFuncBuilder`, see [`ExprFunctionExt`]
+    fn new(fun: Option<ExprFuncKind>) -> Self {
+        Self {
+            fun,
+            order_by: None,
+            filter: None,
+            distinct: false,
+            null_treatment: None,
+            partition_by: None,
+            window_frame: None,
+        }
+    }
+
+    /// Updates and returns the in progress [`Expr::AggregateFunction`] or [`Expr::WindowFunction`]
+    ///
+    /// # Errors:
+    ///
+    /// Returns an error if this builder  [`ExprFunctionExt`] was used with an
+    /// `Expr` variant other than [`Expr::AggregateFunction`] or [`Expr::WindowFunction`]
+    pub fn build(self) -> Result<Expr> {
+        let Self {
+            fun,
+            order_by,
+            filter,
+            distinct,
+            null_treatment,
+            partition_by,
+            window_frame,
+        } = self;
+
+        let Some(fun) = fun else {
+            return plan_err!(
+                "ExprFunctionExt can only be used with Expr::AggregateFunction or Expr::WindowFunction"
+            );
+        };
+
+        let fun_expr = match fun {
+            ExprFuncKind::Aggregate(mut udaf) => {
+                udaf.params.order_by = order_by.unwrap_or_default();
+                udaf.params.filter = filter.map(Box::new);
+                udaf.params.distinct = distinct;
+                udaf.params.null_treatment = null_treatment;
+                Expr::AggregateFunction(udaf)
+            }
+            ExprFuncKind::Window(mut udwf) => {
+                let has_order_by = order_by.as_ref().map(|o| !o.is_empty());
+                udwf.params.partition_by = partition_by.unwrap_or_default();
+                udwf.params.order_by = order_by.unwrap_or_default();
+                udwf.params.window_frame =
+                    window_frame.unwrap_or_else(|| WindowFrame::new(has_order_by));
+                udwf.params.filter = filter.map(Box::new);
+                udwf.params.null_treatment = null_treatment;
+                udwf.params.distinct = distinct;
+                Expr::WindowFunction(udwf)
+            }
+        };
+
+        Ok(fun_expr)
+    }
+}
+
+impl ExprFunctionExt for ExprFuncBuilder {
+    /// Add `ORDER BY <order_by>`
+    fn order_by(mut self, order_by: Vec<Sort>) -> ExprFuncBuilder {
+        self.order_by = Some(order_by);
+        self
+    }
+
+    /// Add `FILTER <filter>`
+    fn filter(mut self, filter: Expr) -> ExprFuncBuilder {
+        self.filter = Some(filter);
+        self
+    }
+
+    /// Add `DISTINCT`
+    fn distinct(mut self) -> ExprFuncBuilder {
+        self.distinct = true;
+        self
+    }
+
+    /// Add `RESPECT NULLS` or `IGNORE NULLS`
+    fn null_treatment(
+        mut self,
+        null_treatment: impl Into<Option<NullTreatment>>,
+    ) -> ExprFuncBuilder {
+        self.null_treatment = null_treatment.into();
+        self
+    }
+
+    fn partition_by(mut self, partition_by: Vec<Expr>) -> ExprFuncBuilder {
+        self.partition_by = Some(partition_by);
+        self
+    }
+
+    fn window_frame(mut self, window_frame: WindowFrame) -> ExprFuncBuilder {
+        self.window_frame = Some(window_frame);
+        self
+    }
+}
+
+impl ExprFunctionExt for Expr {
+    fn order_by(self, order_by: Vec<Sort>) -> ExprFuncBuilder {
+        let mut builder = match self {
+            Expr::AggregateFunction(udaf) => {
+                ExprFuncBuilder::new(Some(ExprFuncKind::Aggregate(udaf)))
+            }
+            Expr::WindowFunction(udwf) => {
+                ExprFuncBuilder::new(Some(ExprFuncKind::Window(udwf)))
+            }
+            _ => ExprFuncBuilder::new(None),
+        };
+        if builder.fun.is_some() {
+            builder.order_by = Some(order_by);
+        }
+        builder
+    }
+    fn filter(self, filter: Expr) -> ExprFuncBuilder {
+        match self {
+            Expr::AggregateFunction(udaf) => {
+                let mut builder =
+                    ExprFuncBuilder::new(Some(ExprFuncKind::Aggregate(udaf)));
+                builder.filter = Some(filter);
+                builder
+            }
+            _ => ExprFuncBuilder::new(None),
+        }
+    }
+    fn distinct(self) -> ExprFuncBuilder {
+        match self {
+            Expr::AggregateFunction(udaf) => {
+                let mut builder =
+                    ExprFuncBuilder::new(Some(ExprFuncKind::Aggregate(udaf)));
+                builder.distinct = true;
+                builder
+            }
+            _ => ExprFuncBuilder::new(None),
+        }
+    }
+    fn null_treatment(
+        self,
+        null_treatment: impl Into<Option<NullTreatment>>,
+    ) -> ExprFuncBuilder {
+        let mut builder = match self {
+            Expr::AggregateFunction(udaf) => {
+                ExprFuncBuilder::new(Some(ExprFuncKind::Aggregate(udaf)))
+            }
+            Expr::WindowFunction(udwf) => {
+                ExprFuncBuilder::new(Some(ExprFuncKind::Window(udwf)))
+            }
+            _ => ExprFuncBuilder::new(None),
+        };
+        if builder.fun.is_some() {
+            builder.null_treatment = null_treatment.into();
+        }
+        builder
+    }
+
+    fn partition_by(self, partition_by: Vec<Expr>) -> ExprFuncBuilder {
+        match self {
+            Expr::WindowFunction(udwf) => {
+                let mut builder = ExprFuncBuilder::new(Some(ExprFuncKind::Window(udwf)));
+                builder.partition_by = Some(partition_by);
+                builder
+            }
+            _ => ExprFuncBuilder::new(None),
+        }
+    }
+
+    fn window_frame(self, window_frame: WindowFrame) -> ExprFuncBuilder {
+        match self {
+            Expr::WindowFunction(udwf) => {
+                let mut builder = ExprFuncBuilder::new(Some(ExprFuncKind::Window(udwf)));
+                builder.window_frame = Some(window_frame);
+                builder
+            }
+            _ => ExprFuncBuilder::new(None),
+        }
     }
 }
 
@@ -493,176 +1006,11 @@ mod test {
     #[test]
     fn filter_is_null_and_is_not_null() {
         let col_null = col("col1");
-        let col_not_null = col("col2");
-        assert_eq!(format!("{:?}", col_null.is_null()), "#col1 IS NULL");
+        let col_not_null = ident("col2");
+        assert_eq!(format!("{}", col_null.is_null()), "col1 IS NULL");
         assert_eq!(
-            format!("{:?}", col_not_null.is_not_null()),
-            "#col2 IS NOT NULL"
+            format!("{}", col_not_null.is_not_null()),
+            "col2 IS NOT NULL"
         );
-    }
-
-    macro_rules! test_unary_scalar_expr {
-        ($ENUM:ident, $FUNC:ident) => {{
-            if let Expr::ScalarFunction { fun, args } = $FUNC(col("tableA.a")) {
-                let name = built_in_function::BuiltinScalarFunction::$ENUM;
-                assert_eq!(name, fun);
-                assert_eq!(1, args.len());
-            } else {
-                assert!(false, "unexpected");
-            }
-        }};
-    }
-
-    macro_rules! test_scalar_expr {
-        ($ENUM:ident, $FUNC:ident, $($arg:ident),*) => {
-            let expected = vec![$(stringify!($arg)),*];
-            let result = $FUNC(
-                $(
-                    col(stringify!($arg.to_string()))
-                ),*
-            );
-            if let Expr::ScalarFunction { fun, args } = result {
-                let name = built_in_function::BuiltinScalarFunction::$ENUM;
-                assert_eq!(name, fun);
-                assert_eq!(expected.len(), args.len());
-            } else {
-                assert!(false, "unexpected: {:?}", result);
-            }
-        };
-    }
-
-    macro_rules! test_nary_scalar_expr {
-        ($ENUM:ident, $FUNC:ident, $($arg:ident),*) => {
-            let expected = vec![$(stringify!($arg)),*];
-            let result = $FUNC(
-                vec![
-                    $(
-                        col(stringify!($arg.to_string()))
-                    ),*
-                ]
-            );
-            if let Expr::ScalarFunction { fun, args } = result {
-                let name = built_in_function::BuiltinScalarFunction::$ENUM;
-                assert_eq!(name, fun);
-                assert_eq!(expected.len(), args.len());
-            } else {
-                assert!(false, "unexpected: {:?}", result);
-            }
-        };
-    }
-
-    #[test]
-    fn scalar_function_definitions() {
-        test_unary_scalar_expr!(Sqrt, sqrt);
-        test_unary_scalar_expr!(Sin, sin);
-        test_unary_scalar_expr!(Cos, cos);
-        test_unary_scalar_expr!(Tan, tan);
-        test_unary_scalar_expr!(Asin, asin);
-        test_unary_scalar_expr!(Acos, acos);
-        test_unary_scalar_expr!(Atan, atan);
-        test_unary_scalar_expr!(Floor, floor);
-        test_unary_scalar_expr!(Ceil, ceil);
-        test_unary_scalar_expr!(Now, now);
-        test_unary_scalar_expr!(Round, round);
-        test_unary_scalar_expr!(Trunc, trunc);
-        test_unary_scalar_expr!(Abs, abs);
-        test_unary_scalar_expr!(Signum, signum);
-        test_unary_scalar_expr!(Exp, exp);
-        test_unary_scalar_expr!(Log2, log2);
-        test_unary_scalar_expr!(Log10, log10);
-        test_unary_scalar_expr!(Ln, ln);
-        test_scalar_expr!(Atan2, atan2, y, x);
-
-        test_scalar_expr!(Ascii, ascii, input);
-        test_scalar_expr!(BitLength, bit_length, string);
-        test_nary_scalar_expr!(Btrim, btrim, string);
-        test_nary_scalar_expr!(Btrim, btrim, string, characters);
-        test_scalar_expr!(CharacterLength, character_length, string);
-        test_scalar_expr!(CharacterLength, length, string);
-        test_scalar_expr!(Chr, chr, string);
-        test_scalar_expr!(Digest, digest, string, algorithm);
-        test_scalar_expr!(InitCap, initcap, string);
-        test_scalar_expr!(Left, left, string, count);
-        test_scalar_expr!(Lower, lower, string);
-        test_nary_scalar_expr!(Lpad, lpad, string, count);
-        test_nary_scalar_expr!(Lpad, lpad, string, count, characters);
-        test_scalar_expr!(Ltrim, ltrim, string);
-        test_scalar_expr!(MD5, md5, string);
-        test_scalar_expr!(OctetLength, octet_length, string);
-        test_nary_scalar_expr!(RegexpMatch, regexp_match, string, pattern);
-        test_nary_scalar_expr!(RegexpMatch, regexp_match, string, pattern, flags);
-        test_nary_scalar_expr!(
-            RegexpReplace,
-            regexp_replace,
-            string,
-            pattern,
-            replacement
-        );
-        test_nary_scalar_expr!(
-            RegexpReplace,
-            regexp_replace,
-            string,
-            pattern,
-            replacement,
-            flags
-        );
-        test_scalar_expr!(Replace, replace, string, from, to);
-        test_scalar_expr!(Repeat, repeat, string, count);
-        test_scalar_expr!(Reverse, reverse, string);
-        test_scalar_expr!(Right, right, string, count);
-        test_nary_scalar_expr!(Rpad, rpad, string, count);
-        test_nary_scalar_expr!(Rpad, rpad, string, count, characters);
-        test_scalar_expr!(Rtrim, rtrim, string);
-        test_scalar_expr!(SHA224, sha224, string);
-        test_scalar_expr!(SHA256, sha256, string);
-        test_scalar_expr!(SHA384, sha384, string);
-        test_scalar_expr!(SHA512, sha512, string);
-        test_scalar_expr!(SplitPart, split_part, expr, delimiter, index);
-        test_scalar_expr!(StartsWith, starts_with, string, characters);
-        test_scalar_expr!(Strpos, strpos, string, substring);
-        test_scalar_expr!(Substr, substr, string, position);
-        test_scalar_expr!(ToHex, to_hex, string);
-        test_scalar_expr!(Translate, translate, string, from, to);
-        test_scalar_expr!(Trim, trim, string);
-        test_scalar_expr!(Upper, upper, string);
-
-        test_scalar_expr!(DatePart, date_part, part, date);
-        test_scalar_expr!(DateTrunc, date_trunc, part, date);
-        test_scalar_expr!(DateBin, date_bin, stride, source, origin);
-        test_scalar_expr!(FromUnixtime, from_unixtime, unixtime);
-    }
-
-    #[test]
-    fn digest_function_definitions() {
-        if let Expr::ScalarFunction { fun, args } = digest(col("tableA.a"), lit("md5")) {
-            let name = BuiltinScalarFunction::Digest;
-            assert_eq!(name, fun);
-            assert_eq!(2, args.len());
-        } else {
-            unreachable!();
-        }
-    }
-
-    #[test]
-    fn combine_zero_filters() {
-        let result = combine_filters(&[]);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn combine_one_filter() {
-        let filter = binary_expr(col("c1"), Operator::Lt, lit(1));
-        let result = combine_filters(&[filter.clone()]);
-        assert_eq!(result, Some(filter));
-    }
-
-    #[test]
-    fn combine_multiple_filters() {
-        let filter1 = binary_expr(col("c1"), Operator::Lt, lit(1));
-        let filter2 = binary_expr(col("c2"), Operator::Lt, lit(2));
-        let filter3 = binary_expr(col("c3"), Operator::Lt, lit(3));
-        let result =
-            combine_filters(&[filter1.clone(), filter2.clone(), filter3.clone()]);
-        assert_eq!(result, Some(and(and(filter1, filter2), filter3)));
     }
 }

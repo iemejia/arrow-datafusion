@@ -15,249 +15,77 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::Write;
-
-use tempfile::TempDir;
+use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::test_util::TestTableFactory;
 
 use super::*;
 
 #[tokio::test]
-async fn create_table_as() -> Result<()> {
-    let ctx = SessionContext::new();
-    register_aggregate_simple_csv(&ctx).await?;
+async fn create_custom_table() -> Result<()> {
+    let mut state = SessionStateBuilder::new().with_default_features().build();
+    state
+        .table_factories_mut()
+        .insert("DELTATABLE".to_string(), Arc::new(TestTableFactory {}));
+    let ctx = SessionContext::new_with_state(state);
 
-    let sql = "CREATE TABLE my_table AS SELECT * FROM aggregate_simple";
+    let sql = "CREATE EXTERNAL TABLE dt STORED AS DELTATABLE LOCATION 's3://bucket/schema/table';";
     ctx.sql(sql).await.unwrap();
 
-    let sql_all = "SELECT * FROM my_table order by c1 LIMIT 1";
-    let results_all = execute_to_batches(&ctx, sql_all).await;
-
-    let expected = vec![
-        "+---------+----------------+------+",
-        "| c1      | c2             | c3   |",
-        "+---------+----------------+------+",
-        "| 0.00001 | 0.000000000001 | true |",
-        "+---------+----------------+------+",
-    ];
-
-    assert_batches_eq!(expected, &results_all);
+    let cat = ctx.catalog("datafusion").unwrap();
+    let schema = cat.schema("public").unwrap();
+    let exists = schema.table_exist("dt");
+    assert!(exists, "Table should have been created!");
 
     Ok(())
 }
 
 #[tokio::test]
-async fn create_or_replace_table_as() -> Result<()> {
-    // the information schema used to introduce cyclic Arcs
-    let ctx =
-        SessionContext::with_config(SessionConfig::new().with_information_schema(true));
+async fn create_external_table_with_ddl() -> Result<()> {
+    let mut state = SessionStateBuilder::new().with_default_features().build();
+    state
+        .table_factories_mut()
+        .insert("MOCKTABLE".to_string(), Arc::new(TestTableFactory {}));
+    let ctx = SessionContext::new_with_state(state);
 
-    // Create table
-    ctx.sql("CREATE TABLE y AS VALUES (1,2),(3,4)")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+    let sql = "CREATE EXTERNAL TABLE dt (a_id integer, a_str string, a_bool boolean) STORED AS MOCKTABLE LOCATION 'mockprotocol://path/to/table';";
+    ctx.sql(sql).await.unwrap();
 
-    // Replace table
-    ctx.sql("CREATE OR REPLACE TABLE y AS VALUES (5,6)")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+    let cat = ctx.catalog("datafusion").unwrap();
+    let schema = cat.schema("public").unwrap();
 
-    let sql_all = "SELECT * FROM y";
-    let results_all = execute_to_batches(&ctx, sql_all).await;
+    let exists = schema.table_exist("dt");
+    assert!(exists, "Table should have been created!");
 
-    let expected = vec![
-        "+---------+---------+",
-        "| column1 | column2 |",
-        "+---------+---------+",
-        "| 5       | 6       |",
-        "+---------+---------+",
-    ];
+    let table_schema = schema.table("dt").await.unwrap().unwrap().schema();
 
-    assert_batches_eq!(expected, &results_all);
+    assert_eq!(3, table_schema.fields().len());
 
-    // 'IF NOT EXISTS' cannot coexist with 'REPLACE'
-    let result = ctx
-        .sql("CREATE OR REPLACE TABLE if not exists y AS VALUES (7,8)")
-        .await;
-    assert!(
-        result.is_err(),
-        "'IF NOT EXISTS' cannot coexist with 'REPLACE'"
-    );
+    assert_eq!(&DataType::Int32, table_schema.field(0).data_type());
+    assert_eq!(&DataType::Utf8View, table_schema.field(1).data_type());
+    assert_eq!(&DataType::Boolean, table_schema.field(2).data_type());
 
     Ok(())
 }
 
 #[tokio::test]
-async fn drop_table() -> Result<()> {
-    let ctx = SessionContext::new();
-    register_aggregate_simple_csv(&ctx).await?;
-
-    let sql = "CREATE TABLE my_table AS SELECT * FROM aggregate_simple";
-    ctx.sql(sql).await.unwrap();
-
-    let sql = "DROP TABLE my_table";
-    ctx.sql(sql).await.unwrap();
-
-    let result = ctx.table("my_table");
-    assert!(result.is_err(), "drop table should deregister table.");
-
-    let sql = "DROP TABLE IF EXISTS my_table";
-    ctx.sql(sql).await.unwrap();
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn csv_query_create_external_table() {
-    let ctx = SessionContext::new();
-    register_aggregate_csv_by_sql(&ctx).await;
-    let sql = "SELECT c1, c2, c3, c4, c5, c6, c7, c8, c9, 10, c11, c12, c13 FROM aggregate_test_100 LIMIT 1";
-    let actual = execute_to_batches(&ctx, sql).await;
-    let expected = vec![
-        "+----+----+----+-------+------------+----------------------+----+-------+------------+-----------+-------------+--------------------+--------------------------------+",
-        "| c1 | c2 | c3 | c4    | c5         | c6                   | c7 | c8    | c9         | Int64(10) | c11         | c12                | c13                            |",
-        "+----+----+----+-------+------------+----------------------+----+-------+------------+-----------+-------------+--------------------+--------------------------------+",
-        "| c  | 2  | 1  | 18109 | 2033001162 | -6513304855495910254 | 25 | 43062 | 1491205016 | 10        | 0.110830784 | 0.9294097332465232 | 6WfVFBVGJSQb7FhA7E0lBwdvjfZnSW |",
-        "+----+----+----+-------+------------+----------------------+----+-------+------------+-----------+-------------+--------------------+--------------------------------+",
-    ];
-    assert_batches_eq!(expected, &actual);
-}
-
-#[tokio::test]
-async fn create_external_table_with_timestamps() {
+async fn create_drop_table() -> Result<()> {
     let ctx = SessionContext::new();
 
-    let data = "Jorge,2018-12-13T12:12:10.011Z\n\
-                Andrew,2018-11-13T17:11:10.011Z";
-
-    let tmp_dir = TempDir::new().unwrap();
-    let file_path = tmp_dir.path().join("timestamps.csv");
-
-    // scope to ensure the file is closed and written
-    {
-        std::fs::File::create(&file_path)
-            .expect("creating temp file")
-            .write_all(data.as_bytes())
-            .expect("writing data");
-    }
-
-    let sql = format!(
-        "CREATE EXTERNAL TABLE csv_with_timestamps (
-                  name VARCHAR,
-                  ts TIMESTAMP
-              )
-              STORED AS CSV
-              LOCATION '{}'
-              ",
-        file_path.to_str().expect("path is utf8")
-    );
-
-    plan_and_collect(&ctx, &sql)
-        .await
-        .expect("Executing CREATE EXTERNAL TABLE");
-
-    let sql = "SELECT * from csv_with_timestamps";
-    let result = plan_and_collect(&ctx, sql).await.unwrap();
-    let expected = vec![
-        "+--------+-------------------------+",
-        "| name   | ts                      |",
-        "+--------+-------------------------+",
-        "| Andrew | 2018-11-13 17:11:10.011 |",
-        "| Jorge  | 2018-12-13 12:12:10.011 |",
-        "+--------+-------------------------+",
-    ];
-    assert_batches_sorted_eq!(expected, &result);
-}
-
-#[tokio::test]
-#[should_panic(expected = "already exists")]
-async fn sql_create_duplicate_table() {
-    // the information schema used to introduce cyclic Arcs
-    let ctx =
-        SessionContext::with_config(SessionConfig::new().with_information_schema(true));
-
-    // Create table
-    ctx.sql("CREATE TABLE y AS VALUES (1,2,3)")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-
-    // Create table again
-    let result = ctx
-        .sql("CREATE TABLE y AS VALUES (1,2,3)")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-
-    assert_eq!(result, Vec::new());
-}
-
-#[tokio::test]
-async fn sql_create_table_if_not_exists() -> Result<()> {
-    // the information schema used to introduce cyclic Arcs
-    let ctx =
-        SessionContext::with_config(SessionConfig::new().with_information_schema(true));
-
-    // Create table
-    ctx.sql("CREATE TABLE y AS VALUES (1,2,3)")
-        .await?
-        .collect()
-        .await?;
-
-    // Create table again
-    let result = ctx
-        .sql("CREATE TABLE IF NOT EXISTS y AS VALUES (1,2,3)")
-        .await?
-        .collect()
-        .await?;
-
-    assert_eq!(result, Vec::new());
-
-    // Create external table
-    ctx.sql("CREATE EXTERNAL TABLE aggregate_simple STORED AS CSV WITH HEADER ROW LOCATION 'tests/aggregate_simple.csv'")
-        .await?
-        .collect()
-        .await?;
-
-    // Create external table
-    let result = ctx.sql("CREATE EXTERNAL TABLE IF NOT EXISTS aggregate_simple STORED AS CSV WITH HEADER ROW LOCATION 'tests/aggregate_simple.csv'")
-        .await?
-        .collect()
-        .await?;
-
-    assert_eq!(result, Vec::new());
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn create_pipe_delimited_csv_table() -> Result<()> {
-    let ctx = SessionContext::new();
-
-    let sql = "CREATE EXTERNAL TABLE aggregate_simple STORED AS CSV WITH HEADER ROW DELIMITER '|' LOCATION 'tests/aggregate_simple_pipe.csv'";
+    let sql = "CREATE TABLE dt (a_id integer, a_str string, a_bool boolean);";
     ctx.sql(sql).await.unwrap();
 
-    let sql_all = "SELECT * FROM aggregate_simple order by c1 LIMIT 1";
-    let results_all = execute_to_batches(&ctx, sql_all).await;
+    let cat = ctx.catalog("datafusion").unwrap();
+    let schema = cat.schema("public").unwrap();
 
-    let expected = vec![
-        "+---------+----------------+------+",
-        "| c1      | c2             | c3   |",
-        "+---------+----------------+------+",
-        "| 0.00001 | 0.000000000001 | true |",
-        "+---------+----------------+------+",
-    ];
+    let exists = schema.table_exist("dt");
+    assert!(exists, "Table should have been created!");
 
-    assert_batches_eq!(expected, &results_all);
+    // Drop the table
+    let sql = "DROP TABLE dt;";
+    ctx.sql(sql).await.unwrap();
+
+    let exists = schema.table_exist("dt");
+    assert!(!exists, "Table should have been dropped!");
 
     Ok(())
 }

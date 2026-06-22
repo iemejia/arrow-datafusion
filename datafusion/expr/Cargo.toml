@@ -18,24 +18,54 @@
 [package]
 name = "datafusion-expr"
 description = "Logical plan and expression representation for DataFusion query engine"
-version = "10.0.0"
-homepage = "https://github.com/apache/arrow-datafusion"
-repository = "https://github.com/apache/arrow-datafusion"
+keywords = ["datafusion", "logical", "plan", "expressions"]
 readme = "README.md"
-authors = ["Apache Arrow <dev@arrow.apache.org>"]
-license = "Apache-2.0"
-keywords = [ "datafusion", "logical", "plan", "expressions" ]
-edition = "2021"
-rust-version = "1.62"
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+rust-version = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+
+# Note: add additional linter rules in lib.rs.
+# Rust does not support workspace + new linter rules in subcrates yet
+# https://github.com/rust-lang/cargo/issues/13157
+[lints]
+workspace = true
 
 [lib]
 name = "datafusion_expr"
-path = "src/lib.rs"
 
 [features]
+default = ["sql"]
+recursive_protection = ["dep:recursive"]
+sql = ["sqlparser"]
 
 [dependencies]
-ahash = { version = "0.7", default-features = false }
-arrow = { version = "20.0.0", features = ["prettyprint"] }
-datafusion-common = { path = "../common", version = "10.0.0" }
-sqlparser = "0.20"
+arrow = { workspace = true, features = ["canonical_extension_types"] }
+arrow-schema = { workspace = true, features = ["canonical_extension_types"] }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+datafusion-common = { workspace = true, default-features = false }
+datafusion-doc = { workspace = true }
+datafusion-expr-common = { workspace = true }
+datafusion-functions-aggregate-common = { workspace = true }
+datafusion-functions-window-common = { workspace = true }
+datafusion-physical-expr-common = { workspace = true }
+indexmap = { workspace = true }
+itertools = { workspace = true }
+recursive = { workspace = true, optional = true }
+serde_json = { workspace = true }
+sqlparser = { workspace = true, optional = true }
+
+[dev-dependencies]
+ctor = { workspace = true }
+env_logger = { workspace = true }
+insta = { workspace = true }
+# Makes sure `test_display_pg_json` behaves in a consistent way regardless of
+# feature unification with dependencies
+serde_json = { workspace = true, features = ["preserve_order"] }

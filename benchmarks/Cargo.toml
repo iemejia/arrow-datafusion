@@ -6,7 +6,7 @@
 # "License"); you may not use this file except in compliance
 # with the License.  You may obtain a copy of the License at
 #
-#   http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing,
 # software distributed under the License is distributed on an
@@ -18,28 +18,54 @@
 [package]
 name = "datafusion-benchmarks"
 description = "DataFusion Benchmarks"
-version = "5.0.0"
-edition = "2021"
-authors = ["Apache Arrow <dev@arrow.apache.org>"]
-homepage = "https://github.com/apache/arrow-datafusion"
-repository = "https://github.com/apache/arrow-datafusion"
-license = "Apache-2.0"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
 publish = false
-rust-version = "1.59"
+
+# Note: add additional linter rules in lib.rs.
+# Rust does not support workspace + new linter rules in subcrates yet
+# https://github.com/rust-lang/cargo/issues/13157
+[lints]
+workspace = true
 
 [features]
-simd = ["datafusion/simd"]
+ci = []
+default = ["mimalloc"]
 snmalloc = ["snmalloc-rs"]
+mimalloc_extended = ["libmimalloc-sys/extended"]
 
 [dependencies]
-datafusion = { path = "../datafusion/core" }
-env_logger = "0.9"
-futures = "0.3"
+arrow = { workspace = true }
+async-trait = "0.1"
+bytes = { workspace = true }
+clap = { version = "4.6.0", features = ["derive", "env"] }
+criterion = { workspace = true, features = ["html_reports"] }
+datafusion = { workspace = true, default-features = true }
+datafusion-common = { workspace = true, default-features = true }
+env_logger = { workspace = true }
+futures = { workspace = true }
+libmimalloc-sys = { version = "0.1", optional = true }
+log = { workspace = true }
 mimalloc = { version = "0.1", optional = true, default-features = false }
-num_cpus = "1.13.0"
-rand = "0.8.4"
-serde = { version = "1.0.136", features = ["derive"] }
-serde_json = "1.0.78"
-snmalloc-rs = { version = "0.3", optional = true }
-structopt = { version = "0.3", default-features = false }
-tokio = { version = "^1.0", features = ["macros", "rt", "rt-multi-thread", "parking_lot"] }
+object_store = { workspace = true }
+parquet = { workspace = true, default-features = true }
+rand = { workspace = true }
+regex.workspace = true
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { workspace = true }
+snmalloc-rs = { version = "0.7", optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "parking_lot"] }
+tokio-util = { version = "0.7.17" }
+
+[dev-dependencies]
+datafusion-proto = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+harness = false
+name = "sql"

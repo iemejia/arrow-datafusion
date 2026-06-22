@@ -15,13 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[macro_use]
-extern crate criterion;
-use criterion::{BatchSize, Criterion};
-extern crate arrow;
-extern crate datafusion;
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
-use std::{iter::FromIterator, sync::Arc};
+use std::sync::Arc;
 
 use arrow::{
     array::{ArrayRef, Int64Array, StringArray},
@@ -32,15 +28,18 @@ use tokio::runtime::Runtime;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{
     collect,
-    expressions::{col, PhysicalSortExpr},
-    memory::MemoryExec,
+    expressions::{PhysicalSortExpr, col},
 };
 use datafusion::prelude::SessionContext;
+use datafusion_datasource::memory::MemorySourceConfig;
+use datafusion_physical_expr_common::sort_expr::LexOrdering;
 
-// Initialise the operator using the provided record batches and the sort key
+// Initialize the operator using the provided record batches and the sort key
 // as inputs. All record batches must have the same schema.
+#[expect(clippy::needless_pass_by_value)]
 fn sort_preserving_merge_operator(
     session_ctx: Arc<SessionContext>,
+    rt: &Runtime,
     batches: Vec<RecordBatch>,
     sort: &[&str],
 ) {
@@ -48,21 +47,17 @@ fn sort_preserving_merge_operator(
 
     let sort = sort
         .iter()
-        .map(|name| PhysicalSortExpr {
-            expr: col(name, &schema).unwrap(),
-            options: Default::default(),
-        })
-        .collect::<Vec<_>>();
+        .map(|name| PhysicalSortExpr::new_default(col(name, &schema).unwrap()));
+    let sort = LexOrdering::new(sort).unwrap();
 
-    let exec = MemoryExec::try_new(
+    let exec = MemorySourceConfig::try_new_exec(
         &batches.into_iter().map(|rb| vec![rb]).collect::<Vec<_>>(),
         schema,
         None,
     )
     .unwrap();
-    let merge = Arc::new(SortPreservingMergeExec::new(sort, Arc::new(exec)));
+    let merge = Arc::new(SortPreservingMergeExec::new(sort, exec));
     let task_ctx = session_ctx.task_ctx();
-    let rt = Runtime::new().unwrap();
     rt.block_on(collect(merge, task_ctx)).unwrap();
 }
 
@@ -97,9 +92,9 @@ fn batches(
                 j = i;
             }
 
-            col_a.push(Some(format!("a-{:?}", j)));
-            col_b.push(Some(format!("b-{:?}", j)));
-            col_c.push(Some(format!("c-{:?}", j)));
+            col_a.push(Some(format!("a-{j:?}")));
+            col_b.push(Some(format!("b-{j:?}")));
+            col_c.push(Some(format!("c-{j:?}")));
             col_d.push(Some((i + curr_batch_offset) as i64));
 
             current_rows_per_sort_key += 1;
@@ -165,14 +160,16 @@ fn criterion_benchmark(c: &mut Criterion) {
     ];
 
     let ctx = Arc::new(SessionContext::new());
+    let rt = Runtime::new().unwrap();
+
     for (name, input) in benches {
-        let ctx_clone = ctx.clone();
-        c.bench_function(name, move |b| {
+        c.bench_function(name, |b| {
             b.iter_batched(
                 || input.clone(),
                 |input| {
                     sort_preserving_merge_operator(
-                        ctx_clone.clone(),
+                        ctx.clone(),
+                        &rt,
                         input,
                         &["a", "b", "c", "d"],
                     );

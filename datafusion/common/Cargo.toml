@@ -18,33 +18,79 @@
 [package]
 name = "datafusion-common"
 description = "Common functionality for DataFusion query engine"
-version = "10.0.0"
-homepage = "https://github.com/apache/arrow-datafusion"
-repository = "https://github.com/apache/arrow-datafusion"
-readme = "README.md"
-authors = ["Apache Arrow <dev@arrow.apache.org>"]
-license = "Apache-2.0"
 keywords = ["arrow", "query", "sql"]
-edition = "2021"
-rust-version = "1.62"
+readme = "README.md"
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+rust-version = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+
+# Note: add additional linter rules in lib.rs.
+# Rust does not support workspace + new linter rules in subcrates yet
+# https://github.com/rust-lang/cargo/issues/13157
+[lints]
+workspace = true
 
 [lib]
 name = "datafusion_common"
-path = "src/lib.rs"
 
 [features]
-avro = ["apache-avro"]
-jit = ["cranelift-module"]
-pyarrow = ["pyo3"]
+backtrace = []
+parquet_encryption = [
+    "parquet",
+    "parquet/encryption",
+    "dep:hex",
+]
+force_hash_collisions = []
+recursive_protection = ["dep:recursive"]
+parquet = ["dep:parquet"]
+sql = ["sqlparser"]
+
+[[bench]]
+harness = false
+name = "with_hashes"
+
+[[bench]]
+harness = false
+name = "scalar_to_array"
+
+[[bench]]
+harness = false
+name = "stats_merge"
 
 [dependencies]
-apache-avro = { version = "0.14", features = ["snappy"], optional = true }
-arrow = { version = "20.0.0", features = ["prettyprint"] }
-avro-rs = { version = "0.13", features = ["snappy"], optional = true }
-cranelift-module = { version = "0.86.1", optional = true }
-object_store = { version = "0.3", optional = true }
-ordered-float = "3.0"
-parquet = { version = "20.0.0", features = ["arrow"], optional = true }
-pyo3 = { version = "0.16", optional = true }
-serde_json = "1.0"
-sqlparser = "0.20"
+arrow = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true, features = ["canonical_extension_types"] }
+chrono = { workspace = true }
+foldhash = "0.2"
+half = { workspace = true }
+hashbrown = { workspace = true }
+hex = { workspace = true, optional = true }
+indexmap = { workspace = true }
+itertools = { workspace = true }
+libc = "0.2.185"
+log = { workspace = true }
+num-traits = { workspace = true }
+object_store = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true, default-features = true }
+recursive = { workspace = true, optional = true }
+sqlparser = { workspace = true, optional = true }
+tokio = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+web-time = "1.1.0"
+
+[dev-dependencies]
+chrono = { workspace = true }
+criterion = { workspace = true }
+insta = { workspace = true }
+rand = { workspace = true }
+sqlparser = { workspace = true }

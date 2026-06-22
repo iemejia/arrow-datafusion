@@ -20,20 +20,18 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
-use criterion::{criterion_group, criterion_main, Criterion};
-use datafusion::from_slice::FromSlice;
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::prelude::SessionContext;
 use datafusion::{datasource::MemTable, error::Result};
 use futures::executor::block_on;
+use std::hint::black_box;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
-async fn query(ctx: &mut SessionContext, sql: &str) {
-    let rt = Runtime::new().unwrap();
-
+async fn query(ctx: &SessionContext, rt: &Runtime, sql: &str) {
     // execute the query
     let df = rt.block_on(ctx.sql(sql)).unwrap();
-    criterion::black_box(rt.block_on(df.collect()).unwrap());
+    black_box(rt.block_on(df.collect()).unwrap());
 }
 
 fn create_context(array_len: usize, batch_size: usize) -> Result<SessionContext> {
@@ -49,8 +47,8 @@ fn create_context(array_len: usize, batch_size: usize) -> Result<SessionContext>
             RecordBatch::try_new(
                 schema.clone(),
                 vec![
-                    Arc::new(Float32Array::from_slice(&vec![i as f32; batch_size])),
-                    Arc::new(Float64Array::from_slice(&vec![i as f64; batch_size])),
+                    Arc::new(Float32Array::from(vec![i as f32; batch_size])),
+                    Arc::new(Float64Array::from(vec![i as f64; batch_size])),
                 ],
             )
             .unwrap()
@@ -69,27 +67,30 @@ fn create_context(array_len: usize, batch_size: usize) -> Result<SessionContext>
 fn criterion_benchmark(c: &mut Criterion) {
     let array_len = 524_288; // 2^19
     let batch_size = 4096; // 2^12
+    let rt = Runtime::new().unwrap();
 
     c.bench_function("filter_array", |b| {
-        let mut ctx = create_context(array_len, batch_size).unwrap();
-        b.iter(|| block_on(query(&mut ctx, "select f32, f64 from t where f32 >= f64")))
+        let ctx = create_context(array_len, batch_size).unwrap();
+        b.iter(|| block_on(query(&ctx, &rt, "select f32, f64 from t where f32 >= f64")))
     });
 
     c.bench_function("filter_scalar", |b| {
-        let mut ctx = create_context(array_len, batch_size).unwrap();
+        let ctx = create_context(array_len, batch_size).unwrap();
         b.iter(|| {
             block_on(query(
-                &mut ctx,
+                &ctx,
+                &rt,
                 "select f32, f64 from t where f32 >= 250 and f64 > 250",
             ))
         })
     });
 
     c.bench_function("filter_scalar in list", |b| {
-        let mut ctx = create_context(array_len, batch_size).unwrap();
+        let ctx = create_context(array_len, batch_size).unwrap();
         b.iter(|| {
             block_on(query(
-                &mut ctx,
+                &ctx,
+                &rt,
                 "select f32, f64 from t where f32 in (10, 20, 30, 40)",
             ))
         })

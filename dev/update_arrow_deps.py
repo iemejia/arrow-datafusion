@@ -1,26 +1,25 @@
 #!/usr/bin/env python
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
-#
-# Licensed to the Apache Software Foundation (ASF) under one or more
-# contributor license agreements.  See the NOTICE file distributed with
-# this work for additional information regarding copyright ownership.
-# The ASF licenses this file to You under the Apache License, Version 2.0
-# (the "License"); you may not use this file except in compliance with
-# the License.  You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-
-# Script that updates the arrow dependencies in datafusion and ballista, locally
+# Script that updates the arrow dependencies in datafusion locally
 #
 # installation:
-# pip install tomlkit requests
+# uv sync
 #
 # pin all arrow crates deps to a specific version:
 #
@@ -88,8 +87,20 @@ def update_version_cargo_toml(cargo_toml, new_version):
 
     for section in ("dependencies", "dev-dependencies"):
         for (dep_name, constraint) in doc.get(section, {}).items():
-            if dep_name in ("arrow", "parquet", "arrow-flight") and constraint.get("version") is not None:
-                doc[section][dep_name]["version"] = new_version
+            if dep_name in ("arrow", "parquet", "arrow-flight"):
+                if type(constraint) == tomlkit.items.String:
+                    # handle constraint that is (only) a string like '12',
+                    doc[section][dep_name] = new_version
+                elif type(constraint) == dict:
+                    # handle constraint that is itself a struct like
+                    # {'version': '12', 'features': ['prettyprint']}
+                    doc[section][dep_name]["version"] = new_version
+                elif type(constraint) == tomlkit.items.InlineTable:
+                    # handle constraint that is itself a struct like
+                    # {'version': '12', 'features': ['prettyprint']}
+                    doc[section][dep_name]["version"] = new_version
+                else:
+                    print("Unknown type for {} {}: {}", dep_name, constraint, type(constraint))
 
     with open(cargo_toml, 'w') as f:
         f.write(tomlkit.dumps(doc))

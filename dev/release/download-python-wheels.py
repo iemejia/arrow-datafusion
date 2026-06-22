@@ -1,21 +1,20 @@
 #!/usr/bin/env python
-
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-# Licensed to the Apache Software Foundation (ASF) under one or more
-# contributor license agreements.  See the NOTICE file distributed with
-# this work for additional information regarding copyright ownership.
-# The ASF licenses this file to You under the Apache License, Version 2.0
-# (the "License"); you may not use this file except in compliance with
-# the License.  You may obtain a copy of the License at
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 # Script that download python release artifacts from Github
 #
@@ -40,11 +39,11 @@ def main():
     args = parser.parse_args()
 
     tag = args.tag
-    ghp_token = os.environ.get("GH_TOKEN")
+    ghp_token = os.environ.get("GITHUB_TOKEN")
     if not ghp_token:
         print(
             "ERROR: Personal Github token is required to download workflow artifacts. "
-            "Please specify a token through GH_TOKEN environment variable.")
+            "Please specify a token through GITHUB_TOKEN environment variable.")
         sys.exit(1)
 
     print(f"Downloading latest python wheels for RC tag {tag}...")
@@ -53,7 +52,7 @@ def main():
         "Accept": "application/vnd.github.v3+json",
         "Authorization": f"token {ghp_token}",
     }
-    url = f"https://api.github.com/repos/apache/arrow-datafusion/actions/runs?branch={tag}"
+    url = f"https://api.github.com/repos/apache/datafusion/actions/runs?branch={tag}"
     resp = requests.get(url, headers=headers)
     resp.raise_for_status()
 

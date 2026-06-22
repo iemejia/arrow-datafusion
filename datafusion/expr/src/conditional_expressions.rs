@@ -15,32 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-///! Conditional expressions
-use crate::{expr_schema::ExprSchemable, Expr};
+//! Conditional expressions
+use crate::expr::Case;
+use crate::{Expr, expr_schema::ExprSchemable};
 use arrow::datatypes::DataType;
-use datafusion_common::{DFSchema, DataFusionError, Result};
-use std::collections::HashSet;
-
-/// Currently supported types by the coalesce function.
-/// The order of these types correspond to the order on which coercion applies
-/// This should thus be from least informative to most informative
-pub static SUPPORTED_COALESCE_TYPES: &[DataType] = &[
-    DataType::Boolean,
-    DataType::UInt8,
-    DataType::UInt16,
-    DataType::UInt32,
-    DataType::UInt64,
-    DataType::Int8,
-    DataType::Int16,
-    DataType::Int32,
-    DataType::Int64,
-    DataType::Float32,
-    DataType::Float64,
-    DataType::Utf8,
-    DataType::LargeUtf8,
-];
+use datafusion_common::{DFSchema, HashSet, Result, plan_err};
+use itertools::Itertools as _;
 
 /// Helper struct for building [Expr::Case]
+#[derive(Debug, Clone)]
 pub struct CaseBuilder {
     expr: Option<Box<Expr>>,
     when_expr: Vec<Expr>,
@@ -82,7 +65,7 @@ impl CaseBuilder {
     }
 
     fn build(&self) -> Result<Expr> {
-        // collect all "then" expressions
+        // Collect all "then" expressions
         let mut then_expr = self.then_expr.clone();
         if let Some(e) = &self.else_expr {
             then_expr.push(e.as_ref().to_owned());
@@ -91,33 +74,34 @@ impl CaseBuilder {
         let then_types: Vec<DataType> = then_expr
             .iter()
             .map(|e| match e {
-                Expr::Literal(_) => e.get_type(&DFSchema::empty()),
+                Expr::Literal(_, _) => e.get_type(&DFSchema::empty()),
                 _ => Ok(DataType::Null),
             })
             .collect::<Result<Vec<_>>>()?;
 
         if then_types.contains(&DataType::Null) {
-            // cannot verify types until execution type
+            // Cannot verify types until execution type
         } else {
             let unique_types: HashSet<&DataType> = then_types.iter().collect();
-            if unique_types.len() != 1 {
-                return Err(DataFusionError::Plan(format!(
-                    "CASE expression 'then' values had multiple data types: {:?}",
-                    unique_types
-                )));
+            if unique_types.is_empty() {
+                return plan_err!("CASE expression 'then' values had no data types");
+            } else if unique_types.len() != 1 {
+                return plan_err!(
+                    "CASE expression 'then' values had multiple data types: {}",
+                    unique_types.iter().join(", ")
+                );
             }
         }
 
-        Ok(Expr::Case {
-            expr: self.expr.clone(),
-            when_then_expr: self
-                .when_expr
+        Ok(Expr::Case(Case::new(
+            self.expr.clone(),
+            self.when_expr
                 .iter()
                 .zip(self.then_expr.iter())
                 .map(|(w, t)| (Box::new(w.clone()), Box::new(t.clone())))
                 .collect(),
-            else_expr: self.else_expr.clone(),
-        })
+            self.else_expr.clone(),
+        )))
     }
 }
 

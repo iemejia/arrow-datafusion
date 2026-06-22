@@ -17,60 +17,19 @@
   under the License.
 -->
 
-# DataFusion Command-line Interface
+<!-- Note this file is included in the crates.io page as well https://crates.io/crates/datafusion-cli -->
 
-[DataFusion](df) is an extensible query execution framework, written in Rust, that uses Apache Arrow as its in-memory format.
+# Apache DataFusion Command-line Interface
 
-The DataFusion CLI allows SQL queries to be executed by an in-process DataFusion context.
+[Apache DataFusion] is an extensible query execution framework, written in Rust, that uses [Apache Arrow] as its in-memory format.
 
-```ignore
-USAGE:
-    datafusion-cli [OPTIONS]
+DataFusion CLI (`datafusion-cli`) is a small command line utility that runs SQL queries using the DataFusion engine.
 
-OPTIONS:
-    -c, --batch-size <BATCH_SIZE>    The batch size of each query, or use DataFusion default
-    -f, --file <FILE>...             Execute commands from file(s), then exit
-        --format <FORMAT>            [default: table] [possible values: csv, tsv, table, json,
-                                     nd-json]
-    -h, --help                       Print help information
-    -p, --data-path <DATA_PATH>      Path to your data, default to current directory
-    -q, --quiet                      Reduce printing other than the results and work quietly
-    -r, --rc <RC>...                 Run the provided files on startup instead of ~/.datafusionrc
-    -V, --version                    Print version information
-```
+[apache arrow]: https://arrow.apache.org/
+[apache datafusion]: https://datafusion.apache.org/
 
-## Example
+# Frequently Asked Questions
 
-Create a CSV file to query.
+## Where can I find more information?
 
-```bash,ignore
-$ echo "1,2" > data.csv
-```
-
-```sql,ignore
-$ datafusion-cli
-
-DataFusion CLI v8.0.0
-
-> CREATE EXTERNAL TABLE foo (a INT, b INT) STORED AS CSV LOCATION 'data.csv';
-0 rows in set. Query took 0.001 seconds.
-
-> SELECT * FROM foo;
-+---+---+
-| a | b |
-+---+---+
-| 1 | 2 |
-+---+---+
-1 row in set. Query took 0.017 seconds.
-```
-
-## DataFusion-Cli
-
-Build the `datafusion-cli`.
-
-```bash
-cd arrow-datafusion/datafusion-cli
-cargo build
-```
-
-[df]: https://crates.io/crates/datafusion
+See the [`datafusion-cli` documentation](https://datafusion.apache.org/user-guide/cli/index.html) for further information.

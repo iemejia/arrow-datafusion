@@ -17,118 +17,156 @@
 
 //! Physical exec for aggregate window function expressions.
 
-use crate::window::partition_evaluator::find_ranges_in_range;
-use crate::{expressions::PhysicalSortExpr, PhysicalExpr};
-use crate::{window::WindowExpr, AggregateExpr};
-use arrow::compute::concat;
-use arrow::record_batch::RecordBatch;
-use arrow::{array::ArrayRef, datatypes::Field};
-use datafusion_common::DataFusionError;
-use datafusion_common::Result;
-use datafusion_expr::Accumulator;
-use datafusion_expr::{WindowFrame, WindowFrameUnits};
 use std::any::Any;
-use std::iter::IntoIterator;
 use std::ops::Range;
 use std::sync::Arc;
 
-/// A window expr that takes the form of an aggregate function
+use crate::aggregate::AggregateFunctionExpr;
+use crate::window::standard::add_new_ordering_expr_with_partition_by;
+use crate::window::window_expr::{AggregateWindowExpr, WindowFn, filter_array};
+use crate::window::{
+    PartitionBatches, PartitionWindowAggStates, SlidingAggregateWindowExpr, WindowExpr,
+};
+use crate::{EquivalenceProperties, PhysicalExpr};
+
+use arrow::array::ArrayRef;
+use arrow::array::BooleanArray;
+use arrow::datatypes::FieldRef;
+use arrow::record_batch::RecordBatch;
+use datafusion_common::{Result, ScalarValue, exec_datafusion_err};
+use datafusion_expr::{Accumulator, WindowFrame, WindowFrameBound, WindowFrameUnits};
+use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
+
+/// A window expr that takes the form of an aggregate function.
+///
+/// See comments on [`WindowExpr`] for more details.
 #[derive(Debug)]
-pub struct AggregateWindowExpr {
-    aggregate: Arc<dyn AggregateExpr>,
+pub struct PlainAggregateWindowExpr {
+    aggregate: Arc<AggregateFunctionExpr>,
     partition_by: Vec<Arc<dyn PhysicalExpr>>,
     order_by: Vec<PhysicalSortExpr>,
-    window_frame: Option<WindowFrame>,
+    window_frame: Arc<WindowFrame>,
+    is_constant_in_partition: bool,
+    filter: Option<Arc<dyn PhysicalExpr>>,
 }
 
-impl AggregateWindowExpr {
-    /// create a new aggregate window function expression
+impl PlainAggregateWindowExpr {
+    /// Create a new aggregate window function expression
     pub fn new(
-        aggregate: Arc<dyn AggregateExpr>,
+        aggregate: Arc<AggregateFunctionExpr>,
         partition_by: &[Arc<dyn PhysicalExpr>],
         order_by: &[PhysicalSortExpr],
-        window_frame: Option<WindowFrame>,
+        window_frame: Arc<WindowFrame>,
+        filter: Option<Arc<dyn PhysicalExpr>>,
     ) -> Self {
+        let is_constant_in_partition =
+            Self::is_window_constant_in_partition(order_by, &window_frame);
         Self {
             aggregate,
             partition_by: partition_by.to_vec(),
             order_by: order_by.to_vec(),
             window_frame,
+            is_constant_in_partition,
+            filter,
         }
     }
 
-    /// the aggregate window function operates based on window frame, and by default the mode is
-    /// "range".
-    fn evaluation_mode(&self) -> WindowFrameUnits {
-        self.window_frame.unwrap_or_default().units
+    /// Get aggregate expr of AggregateWindowExpr
+    pub fn get_aggregate_expr(&self) -> &AggregateFunctionExpr {
+        &self.aggregate
     }
 
-    /// create a new accumulator based on the underlying aggregation function
-    fn create_accumulator(&self) -> Result<AggregateWindowAccumulator> {
-        let accumulator = self.aggregate.create_accumulator()?;
-        Ok(AggregateWindowAccumulator { accumulator })
+    pub fn add_equal_orderings(
+        &self,
+        eq_properties: &mut EquivalenceProperties,
+        window_expr_index: usize,
+    ) -> Result<()> {
+        if let Some(expr) = self
+            .get_aggregate_expr()
+            .get_result_ordering(window_expr_index)
+        {
+            add_new_ordering_expr_with_partition_by(
+                eq_properties,
+                expr,
+                &self.partition_by,
+            )?;
+        }
+        Ok(())
     }
 
-    /// peer based evaluation based on the fact that batch is pre-sorted given the sort columns
-    /// and then per partition point we'll evaluate the peer group (e.g. SUM or MAX gives the same
-    /// results for peers) and concatenate the results.
-    fn peer_based_evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
-        let num_rows = batch.num_rows();
-        let partition_points =
-            self.evaluate_partition_points(num_rows, &self.partition_columns(batch)?)?;
-        let sort_partition_points =
-            self.evaluate_partition_points(num_rows, &self.sort_columns(batch)?)?;
-        let values = self.evaluate_args(batch)?;
-        let results = partition_points
-            .iter()
-            .map(|partition_range| {
-                let sort_partition_points =
-                    find_ranges_in_range(partition_range, &sort_partition_points);
-                let mut window_accumulators = self.create_accumulator()?;
-                sort_partition_points
-                    .iter()
-                    .map(|range| window_accumulators.scan_peers(&values, range))
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect::<Result<Vec<Vec<ArrayRef>>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<ArrayRef>>();
-        let results = results.iter().map(|i| i.as_ref()).collect::<Vec<_>>();
-        concat(&results).map_err(DataFusionError::ArrowError)
-    }
+    // Returns true if every row in the partition has the same window frame. This allows
+    // for preventing bound + function calculation for every row due to the values being the
+    // same.
+    //
+    // This occurs when both bounds fall under either condition below:
+    //  1. Bound is unbounded (`Preceding` or `Following`)
+    //  2. Bound is `CurrentRow` while using `Range` units with no order by clause
+    //  This results in an invalid range specification. Following PostgreSQL’s convention,
+    //  we interpret this as the entire partition being used for the current window frame.
+    fn is_window_constant_in_partition(
+        order_by: &[PhysicalSortExpr],
+        window_frame: &WindowFrame,
+    ) -> bool {
+        let is_constant_bound = |bound: &WindowFrameBound| match bound {
+            WindowFrameBound::CurrentRow => {
+                window_frame.units == WindowFrameUnits::Range && order_by.is_empty()
+            }
+            _ => bound.is_unbounded(),
+        };
 
-    fn group_based_evaluate(&self, _batch: &RecordBatch) -> Result<ArrayRef> {
-        Err(DataFusionError::NotImplemented(format!(
-            "Group based evaluation for {} is not yet implemented",
-            self.name()
-        )))
-    }
-
-    fn row_based_evaluate(&self, _batch: &RecordBatch) -> Result<ArrayRef> {
-        Err(DataFusionError::NotImplemented(format!(
-            "Row based evaluation for {} is not yet implemented",
-            self.name()
-        )))
+        is_constant_bound(&window_frame.start_bound)
+            && is_constant_bound(&window_frame.end_bound)
     }
 }
 
-impl WindowExpr for AggregateWindowExpr {
+/// peer based evaluation based on the fact that batch is pre-sorted given the sort columns
+/// and then per partition point we'll evaluate the peer group (e.g. SUM or MAX gives the same
+/// results for peers) and concatenate the results.
+impl WindowExpr for PlainAggregateWindowExpr {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn field(&self) -> Result<FieldRef> {
+        Ok(self.aggregate.field())
     }
 
     fn name(&self) -> &str {
         self.aggregate.name()
     }
 
-    fn field(&self) -> Result<Field> {
-        self.aggregate.field()
-    }
-
     fn expressions(&self) -> Vec<Arc<dyn PhysicalExpr>> {
         self.aggregate.expressions()
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
+        self.aggregate_evaluate(batch)
+    }
+
+    fn evaluate_stateful(
+        &self,
+        partition_batches: &PartitionBatches,
+        window_agg_state: &mut PartitionWindowAggStates,
+    ) -> Result<()> {
+        self.aggregate_evaluate_stateful(partition_batches, window_agg_state)?;
+
+        // Update window frame range for each partition. As we know that
+        // non-sliding aggregations will never call `retract_batch`, this value
+        // can safely increase, and we can remove "old" parts of the state.
+        // This enables us to run queries involving UNBOUNDED PRECEDING frames
+        // using bounded memory for suitable aggregations.
+        for partition_row in partition_batches.keys() {
+            let window_state = window_agg_state
+                .get_mut(partition_row)
+                .ok_or_else(|| exec_datafusion_err!("Cannot find state"))?;
+            let state = &mut window_state.state;
+            if self.window_frame.start_bound.is_unbounded() {
+                state.window_frame_range.start =
+                    state.window_frame_range.end.saturating_sub(1);
+            }
+        }
+        Ok(())
     }
 
     fn partition_by(&self) -> &[Arc<dyn PhysicalExpr>] {
@@ -139,43 +177,100 @@ impl WindowExpr for AggregateWindowExpr {
         &self.order_by
     }
 
-    /// evaluate the window function values against the batch
-    fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
-        match self.evaluation_mode() {
-            WindowFrameUnits::Range => self.peer_based_evaluate(batch),
-            WindowFrameUnits::Rows => self.row_based_evaluate(batch),
-            WindowFrameUnits::Groups => self.group_based_evaluate(batch),
-        }
+    fn get_window_frame(&self) -> &Arc<WindowFrame> {
+        &self.window_frame
+    }
+
+    fn get_reverse_expr(&self) -> Option<Arc<dyn WindowExpr>> {
+        self.aggregate.reverse_expr().map(|reverse_expr| {
+            let reverse_window_frame = self.window_frame.reverse();
+            if reverse_window_frame.is_ever_expanding() {
+                Arc::new(PlainAggregateWindowExpr::new(
+                    Arc::new(reverse_expr),
+                    &self.partition_by.clone(),
+                    &self
+                        .order_by
+                        .iter()
+                        .map(|e| e.reverse())
+                        .collect::<Vec<_>>(),
+                    Arc::new(self.window_frame.reverse()),
+                    self.filter.clone(),
+                )) as _
+            } else {
+                Arc::new(SlidingAggregateWindowExpr::new(
+                    Arc::new(reverse_expr),
+                    &self.partition_by.clone(),
+                    &self
+                        .order_by
+                        .iter()
+                        .map(|e| e.reverse())
+                        .collect::<Vec<_>>(),
+                    Arc::new(self.window_frame.reverse()),
+                    self.filter.clone(),
+                )) as _
+            }
+        })
+    }
+
+    fn uses_bounded_memory(&self) -> bool {
+        !self.window_frame.end_bound.is_unbounded()
+    }
+
+    fn create_window_fn(&self) -> Result<WindowFn> {
+        Ok(WindowFn::Aggregate(self.get_accumulator()?))
     }
 }
 
-/// Aggregate window accumulator utilizes the accumulator from aggregation and do a accumulative sum
-/// across evaluation arguments based on peer equivalences.
-#[derive(Debug)]
-struct AggregateWindowAccumulator {
-    accumulator: Box<dyn Accumulator>,
-}
+impl AggregateWindowExpr for PlainAggregateWindowExpr {
+    fn get_accumulator(&self) -> Result<Box<dyn Accumulator>> {
+        self.aggregate.create_accumulator()
+    }
 
-impl AggregateWindowAccumulator {
-    /// scan one peer group of values (as arguments to window function) given by the value_range
-    /// and return evaluation result that are of the same number of rows.
-    fn scan_peers(
-        &mut self,
-        values: &[ArrayRef],
-        value_range: &Range<usize>,
-    ) -> Result<ArrayRef> {
-        if value_range.is_empty() {
-            return Err(DataFusionError::Internal(
-                "Value range cannot be empty".to_owned(),
-            ));
+    fn filter_expr(&self) -> Option<&Arc<dyn PhysicalExpr>> {
+        self.filter.as_ref()
+    }
+
+    /// For a given range, calculate accumulation result inside the range on
+    /// `value_slice` and update accumulator state.
+    // We assume that `cur_range` contains `last_range` and their start points
+    // are same. In summary if `last_range` is `Range{start: a,end: b}` and
+    // `cur_range` is `Range{start: a1, end: b1}`, it is guaranteed that a1=a and b1>=b.
+    fn get_aggregate_result_inside_range(
+        &self,
+        last_range: &Range<usize>,
+        cur_range: &Range<usize>,
+        value_slice: &[ArrayRef],
+        accumulator: &mut Box<dyn Accumulator>,
+        filter_mask: Option<&BooleanArray>,
+    ) -> Result<ScalarValue> {
+        if cur_range.start == cur_range.end {
+            self.aggregate
+                .default_value(self.aggregate.field().data_type())
+        } else {
+            // Accumulate any new rows that have entered the window:
+            let update_bound = cur_range.end - last_range.end;
+            // A non-sliding aggregation only processes new data, it never
+            // deals with expiring data as its starting point is always the
+            // same point (i.e. the beginning of the table/frame). Hence, we
+            // do not call `retract_batch`.
+            if update_bound > 0 {
+                let slice_mask =
+                    filter_mask.map(|m| m.slice(last_range.end, update_bound));
+                let update: Vec<ArrayRef> = value_slice
+                    .iter()
+                    .map(|v| v.slice(last_range.end, update_bound))
+                    .map(|arr| match &slice_mask {
+                        Some(m) => filter_array(&arr, m),
+                        None => Ok(arr),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                accumulator.update_batch(&update)?
+            }
+            accumulator.evaluate()
         }
-        let len = value_range.end - value_range.start;
-        let values = values
-            .iter()
-            .map(|v| v.slice(value_range.start, len))
-            .collect::<Vec<_>>();
-        self.accumulator.update_batch(&values)?;
-        let value = self.accumulator.evaluate()?;
-        Ok(value.to_array_of_size(len))
+    }
+
+    fn is_constant_in_partition(&self) -> bool {
+        self.is_constant_in_partition
     }
 }

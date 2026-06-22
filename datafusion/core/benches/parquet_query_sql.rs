@@ -23,21 +23,21 @@ use arrow::datatypes::{
     SchemaRef,
 };
 use arrow::record_batch::RecordBatch;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion::scheduler::Scheduler;
+use datafusion_common::instant::Instant;
 use futures::stream::StreamExt;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{WriterProperties, WriterVersion};
-use rand::distributions::uniform::SampleUniform;
-use rand::distributions::Alphanumeric;
+use rand::distr::Alphanumeric;
+use rand::distr::uniform::SampleUniform;
 use rand::prelude::*;
+use rand::rng;
 use std::fs::File;
 use std::io::Read;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 use tempfile::NamedTempFile;
 
 /// The number of batches to write
@@ -45,7 +45,7 @@ const NUM_BATCHES: usize = 2048;
 /// The number of rows in each record batch to write
 const WRITE_RECORD_BATCH_SIZE: usize = 1024;
 /// The number of rows in a row group
-const ROW_GROUP_SIZE: usize = 1024 * 1024;
+const ROW_GROUP_ROW_COUNT: usize = 1024 * 1024;
 /// The number of row groups expected
 const EXPECTED_ROW_GROUPS: usize = 2;
 
@@ -98,15 +98,13 @@ fn generate_string_dictionary(
     len: usize,
     valid_percent: f64,
 ) -> ArrayRef {
-    let mut rng = thread_rng();
-    let strings: Vec<_> = (0..cardinality)
-        .map(|x| format!("{}#{}", prefix, x))
-        .collect();
+    let mut rng = rng();
+    let strings: Vec<_> = (0..cardinality).map(|x| format!("{prefix}#{x}")).collect();
 
     Arc::new(DictionaryArray::<Int32Type>::from_iter((0..len).map(
         |_| {
-            rng.gen_bool(valid_percent)
-                .then(|| strings[rng.gen_range(0..cardinality)].as_str())
+            rng.random_bool(valid_percent)
+                .then(|| strings[rng.random_range(0..cardinality)].as_str())
         },
     )))
 }
@@ -116,10 +114,10 @@ fn generate_strings(
     len: usize,
     valid_percent: f64,
 ) -> ArrayRef {
-    let mut rng = thread_rng();
+    let mut rng = rng();
     Arc::new(StringArray::from_iter((0..len).map(|_| {
-        rng.gen_bool(valid_percent).then(|| {
-            let string_len = rng.gen_range(string_length_range.clone());
+        rng.random_bool(valid_percent).then(|| {
+            let string_len = rng.random_range(string_length_range.clone());
             (0..string_len)
                 .map(|_| char::from(rng.sample(Alphanumeric)))
                 .collect::<String>()
@@ -136,10 +134,10 @@ where
     T: ArrowPrimitiveType,
     T::Native: SampleUniform,
 {
-    let mut rng = thread_rng();
+    let mut rng = rng();
     Arc::new(PrimitiveArray::<T>::from_iter((0..len).map(|_| {
-        rng.gen_bool(valid_percent)
-            .then(|| rng.gen_range(range.clone()))
+        rng.random_bool(valid_percent)
+            .then(|| rng.random_range(range.clone()))
     })))
 }
 
@@ -156,7 +154,7 @@ fn generate_file() -> NamedTempFile {
 
     let properties = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
-        .set_max_row_group_size(ROW_GROUP_SIZE)
+        .set_max_row_group_row_count(Some(ROW_GROUP_ROW_COUNT))
         .build();
 
     let mut writer =
@@ -168,11 +166,12 @@ fn generate_file() -> NamedTempFile {
     }
 
     let metadata = writer.close().unwrap();
+    let file_metadata = metadata.file_metadata();
     assert_eq!(
-        metadata.num_rows as usize,
+        file_metadata.num_rows() as usize,
         WRITE_RECORD_BATCH_SIZE * NUM_BATCHES
     );
-    assert_eq!(metadata.row_groups.len(), EXPECTED_ROW_GROUPS);
+    assert_eq!(metadata.row_groups().len(), EXPECTED_ROW_GROUPS);
 
     println!(
         "Generated parquet file in {} seconds",
@@ -192,13 +191,11 @@ fn criterion_benchmark(c: &mut Criterion) {
     };
 
     assert!(Path::new(&file_path).exists(), "path not found");
-    println!("Using parquet file {}", file_path);
+    println!("Using parquet file {file_path}");
 
     let partitions = 4;
     let config = SessionConfig::new().with_target_partitions(partitions);
-    let context = SessionContext::with_config(config);
-
-    let scheduler = Scheduler::new(partitions);
+    let context = SessionContext::new_with_config(config);
 
     let local_rt = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -230,7 +227,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             continue;
         }
 
-        c.bench_function(&format!("tokio: {}", query), |b| {
+        c.bench_function(&format!("tokio: {query}"), |b| {
             b.iter(|| {
                 let query = query.clone();
                 let context = context.clone();
@@ -251,26 +248,10 @@ fn criterion_benchmark(c: &mut Criterion) {
                 })
             });
         });
-
-        c.bench_function(&format!("scheduled: {}", query), |b| {
-            b.iter(|| {
-                let query = query.clone();
-                let context = context.clone();
-
-                local_rt.block_on(async {
-                    let query = context.sql(&query).await.unwrap();
-                    let plan = query.create_physical_plan().await.unwrap();
-                    let results = scheduler.schedule(plan, context.task_ctx()).unwrap();
-
-                    let mut stream = results.stream();
-                    while stream.next().await.transpose().unwrap().is_some() {}
-                });
-            });
-        });
     }
 
     // Temporary file must outlive the benchmarks, it is deleted when dropped
-    std::mem::drop(temp_file);
+    drop(temp_file);
 }
 
 criterion_group!(benches, criterion_benchmark);

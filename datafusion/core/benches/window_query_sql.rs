@@ -15,24 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[macro_use]
-extern crate criterion;
-extern crate arrow;
-extern crate datafusion;
-
 mod data_utils;
-use crate::criterion::Criterion;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use data_utils::create_table_provider;
 use datafusion::error::Result;
 use datafusion::execution::context::SessionContext;
 use parking_lot::Mutex;
+use std::hint::black_box;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
-fn query(ctx: Arc<Mutex<SessionContext>>, sql: &str) {
-    let rt = Runtime::new().unwrap();
+#[expect(clippy::needless_pass_by_value)]
+fn query(ctx: Arc<Mutex<SessionContext>>, rt: &Runtime, sql: &str) {
     let df = rt.block_on(ctx.lock().sql(sql)).unwrap();
-    criterion::black_box(rt.block_on(df.collect()).unwrap());
+    black_box(rt.block_on(df.collect()).unwrap());
 }
 
 fn create_context(
@@ -51,11 +48,13 @@ fn criterion_benchmark(c: &mut Criterion) {
     let array_len = 1024 * 1024;
     let batch_size = 8 * 1024;
     let ctx = create_context(partitions_len, array_len, batch_size).unwrap();
+    let rt = Runtime::new().unwrap();
 
     c.bench_function("window empty over, aggregate functions", |b| {
         b.iter(|| {
             query(
                 ctx.clone(),
+                &rt,
                 "SELECT \
                     MAX(f64) OVER (), \
                     MIN(f32) OVER (), \
@@ -69,6 +68,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         b.iter(|| {
             query(
                 ctx.clone(),
+                &rt,
                 "SELECT \
                     FIRST_VALUE(f64) OVER (), \
                     LAST_VALUE(f32) OVER (), \
@@ -82,6 +82,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         b.iter(|| {
             query(
                 ctx.clone(),
+                &rt,
                 "SELECT \
                     MAX(f64) OVER (ORDER BY u64_narrow), \
                     MIN(f32) OVER (ORDER BY u64_narrow DESC), \
@@ -95,6 +96,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         b.iter(|| {
             query(
                 ctx.clone(),
+                &rt,
                 "SELECT \
                   FIRST_VALUE(f64) OVER (ORDER BY u64_narrow), \
                   LAST_VALUE(f32) OVER (ORDER BY u64_narrow DESC), \
@@ -108,6 +110,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         b.iter(|| {
             query(
                 ctx.clone(),
+                &rt,
                 "SELECT \
                   MAX(f64) OVER (PARTITION BY u64_wide), \
                   MIN(f32) OVER (PARTITION BY u64_wide), \
@@ -123,6 +126,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             b.iter(|| {
                 query(
                     ctx.clone(),
+                    &rt,
                     "SELECT \
                   MAX(f64) OVER (PARTITION BY u64_narrow), \
                   MIN(f32) OVER (PARTITION BY u64_narrow), \
@@ -137,6 +141,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         b.iter(|| {
             query(
                 ctx.clone(),
+                &rt,
                 "SELECT \
                   FIRST_VALUE(f64) OVER (PARTITION BY u64_wide), \
                   LAST_VALUE(f32) OVER (PARTITION BY u64_wide), \
@@ -150,6 +155,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         b.iter(|| {
             query(
                 ctx.clone(),
+                &rt,
                 "SELECT \
                   FIRST_VALUE(f64) OVER (PARTITION BY u64_narrow), \
                   LAST_VALUE(f32) OVER (PARTITION BY u64_narrow), \
@@ -165,6 +171,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             b.iter(|| {
                 query(
                     ctx.clone(),
+                    &rt,
                     "SELECT \
                         MAX(f64) OVER (PARTITION BY u64_wide ORDER by f64), \
                         MIN(f32) OVER (PARTITION BY u64_wide ORDER by f64), \
@@ -181,6 +188,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             b.iter(|| {
                 query(
                     ctx.clone(),
+                    &rt,
                     "SELECT \
                         MAX(f64) OVER (PARTITION BY u64_narrow ORDER by f64), \
                         MIN(f32) OVER (PARTITION BY u64_narrow ORDER by f64), \
@@ -197,6 +205,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             b.iter(|| {
                 query(
                     ctx.clone(),
+                    &rt,
                     "SELECT \
                         FIRST_VALUE(f64) OVER (PARTITION BY u64_wide ORDER by f64), \
                         LAST_VALUE(f32) OVER (PARTITION BY u64_wide ORDER by f64), \
@@ -213,6 +222,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             b.iter(|| {
                 query(
                     ctx.clone(),
+                    &rt,
                     "SELECT \
                         FIRST_VALUE(f64) OVER (PARTITION BY u64_narrow ORDER by f64), \
                         LAST_VALUE(f32) OVER (PARTITION BY u64_narrow ORDER by f64), \

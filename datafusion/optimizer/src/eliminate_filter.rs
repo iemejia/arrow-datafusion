@@ -15,172 +15,209 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Optimizer rule to replace `where false` on a plan with an empty relation.
-//! This saves time in planning and executing the query.
-//! Note that this rule should be applied after simplify expressions optimizer rule.
-use crate::{OptimizerConfig, OptimizerRule};
-use datafusion_common::{Result, ScalarValue};
-use datafusion_expr::{
-    logical_plan::{EmptyRelation, Filter, LogicalPlan},
-    utils::from_plan,
-    Expr,
-};
+//! [`EliminateFilter`] replaces `where false` or `where null` with an empty relation.
 
-/// Optimization rule that elimanate the scalar value (true/false) filter with an [LogicalPlan::EmptyRelation]
-#[derive(Default)]
+use datafusion_common::tree_node::Transformed;
+use datafusion_common::{Result, ScalarValue};
+use datafusion_expr::{EmptyRelation, Expr, Filter, LogicalPlan};
+use std::sync::Arc;
+
+use crate::optimizer::ApplyOrder;
+use crate::{OptimizerConfig, OptimizerRule};
+
+/// Optimization rule that eliminate the scalar value (true/false/null) filter
+/// with an [LogicalPlan::EmptyRelation]
+///
+/// This saves time in planning and executing the query.
+/// Note that this rule should be applied after simplify expressions optimizer rule.
+#[derive(Default, Debug)]
 pub struct EliminateFilter;
 
 impl EliminateFilter {
-    #[allow(missing_docs)]
+    #[expect(missing_docs)]
     pub fn new() -> Self {
         Self {}
     }
 }
 
 impl OptimizerRule for EliminateFilter {
-    fn optimize(
-        &self,
-        plan: &LogicalPlan,
-        optimizer_config: &mut OptimizerConfig,
-    ) -> Result<LogicalPlan> {
-        match plan {
-            LogicalPlan::Filter(Filter {
-                predicate: Expr::Literal(ScalarValue::Boolean(Some(v))),
-                input,
-            }) => {
-                if !*v {
-                    Ok(LogicalPlan::EmptyRelation(EmptyRelation {
-                        produce_one_row: false,
-                        schema: input.schema().clone(),
-                    }))
-                } else {
-                    Ok((**input).clone())
-                }
-            }
-            _ => {
-                // Apply the optimization to all inputs of the plan
-                let inputs = plan.inputs();
-                let new_inputs = inputs
-                    .iter()
-                    .map(|plan| self.optimize(plan, optimizer_config))
-                    .collect::<Result<Vec<_>>>()?;
-
-                from_plan(plan, &plan.expressions(), &new_inputs)
-            }
-        }
-    }
-
     fn name(&self) -> &str {
         "eliminate_filter"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::TopDown)
+    }
+
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
+        match plan {
+            LogicalPlan::Filter(Filter {
+                predicate: Expr::Literal(ScalarValue::Boolean(v), _),
+                input,
+                ..
+            }) => match v {
+                Some(true) => Ok(Transformed::yes(Arc::unwrap_or_clone(input))),
+                Some(false) | None => Ok(Transformed::yes(LogicalPlan::EmptyRelation(
+                    EmptyRelation {
+                        produce_one_row: false,
+                        schema: Arc::clone(input.schema()),
+                    },
+                ))),
+            },
+            _ => Ok(Transformed::no(plan)),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::test::*;
-    use datafusion_expr::{col, logical_plan::builder::LogicalPlanBuilder, sum};
+    use std::sync::Arc;
 
-    fn assert_optimized_plan_eq(plan: &LogicalPlan, expected: &str) {
-        let rule = EliminateFilter::new();
-        let optimized_plan = rule
-            .optimize(plan, &mut OptimizerConfig::new())
-            .expect("failed to optimize plan");
-        let formatted_plan = format!("{:?}", optimized_plan);
-        assert_eq!(formatted_plan, expected);
-        assert_eq!(plan.schema(), optimized_plan.schema());
+    use crate::OptimizerContext;
+    use crate::assert_optimized_plan_eq_snapshot;
+    use datafusion_common::{Result, ScalarValue};
+    use datafusion_expr::{Expr, col, lit, logical_plan::builder::LogicalPlanBuilder};
+
+    use crate::eliminate_filter::EliminateFilter;
+    use crate::test::*;
+    use datafusion_expr::test::function_stub::sum;
+
+    macro_rules! assert_optimized_plan_equal {
+        (
+            $plan:expr,
+            @ $expected:literal $(,)?
+        ) => {{
+            let optimizer_ctx = OptimizerContext::new().with_max_passes(1);
+            let rules: Vec<Arc<dyn crate::OptimizerRule + Send + Sync>> = vec![Arc::new(EliminateFilter::new())];
+            assert_optimized_plan_eq_snapshot!(
+                optimizer_ctx,
+                rules,
+                $plan,
+                @ $expected,
+            )
+        }};
     }
 
     #[test]
-    fn fliter_false() {
-        let filter_expr = Expr::Literal(ScalarValue::Boolean(Some(false)));
+    fn filter_false() -> Result<()> {
+        let filter_expr = lit(false);
 
         let table_scan = test_table_scan().unwrap();
         let plan = LogicalPlanBuilder::from(table_scan)
-            .aggregate(vec![col("a")], vec![sum(col("b"))])
-            .unwrap()
-            .filter(filter_expr)
-            .unwrap()
-            .build()
-            .unwrap();
+            .aggregate(vec![col("a")], vec![sum(col("b"))])?
+            .filter(filter_expr)?
+            .build()?;
 
         // No aggregate / scan / limit
-        let expected = "EmptyRelation";
-        assert_optimized_plan_eq(&plan, expected);
+        assert_optimized_plan_equal!(plan, @"EmptyRelation: rows=0")
     }
 
     #[test]
-    fn fliter_false_nested() {
-        let filter_expr = Expr::Literal(ScalarValue::Boolean(Some(false)));
+    fn filter_null() -> Result<()> {
+        let filter_expr = Expr::Literal(ScalarValue::Boolean(None), None);
 
         let table_scan = test_table_scan().unwrap();
-        let plan1 = LogicalPlanBuilder::from(table_scan.clone())
-            .aggregate(vec![col("a")], vec![sum(col("b"))])
-            .unwrap()
-            .build()
-            .unwrap();
         let plan = LogicalPlanBuilder::from(table_scan)
-            .aggregate(vec![col("a")], vec![sum(col("b"))])
-            .unwrap()
-            .filter(filter_expr)
-            .unwrap()
-            .union(plan1)
-            .unwrap()
-            .build()
-            .unwrap();
+            .aggregate(vec![col("a")], vec![sum(col("b"))])?
+            .filter(filter_expr)?
+            .build()?;
+
+        // No aggregate / scan / limit
+        assert_optimized_plan_equal!(plan, @"EmptyRelation: rows=0")
+    }
+
+    #[test]
+    fn filter_false_nested() -> Result<()> {
+        let filter_expr = lit(false);
+
+        let table_scan = test_table_scan()?;
+        let plan1 = LogicalPlanBuilder::from(table_scan.clone())
+            .aggregate(vec![col("a")], vec![sum(col("b"))])?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(vec![col("a")], vec![sum(col("b"))])?
+            .filter(filter_expr)?
+            .union(plan1)?
+            .build()?;
 
         // Left side is removed
-        let expected = "Union\
-            \n  EmptyRelation\
-            \n  Aggregate: groupBy=[[#test.a]], aggr=[[SUM(#test.b)]]\
-            \n    TableScan: test";
-        assert_optimized_plan_eq(&plan, expected);
+        assert_optimized_plan_equal!(plan, @r"
+        Union
+          EmptyRelation: rows=0
+          Aggregate: groupBy=[[test.a]], aggr=[[sum(test.b)]]
+            TableScan: test
+        ")
     }
 
     #[test]
-    fn fliter_true() {
-        let filter_expr = Expr::Literal(ScalarValue::Boolean(Some(true)));
+    fn filter_true() -> Result<()> {
+        let filter_expr = lit(true);
 
-        let table_scan = test_table_scan().unwrap();
+        let table_scan = test_table_scan()?;
         let plan = LogicalPlanBuilder::from(table_scan)
-            .aggregate(vec![col("a")], vec![sum(col("b"))])
-            .unwrap()
-            .filter(filter_expr)
-            .unwrap()
-            .build()
-            .unwrap();
+            .aggregate(vec![col("a")], vec![sum(col("b"))])?
+            .filter(filter_expr)?
+            .build()?;
 
-        let expected = "Aggregate: groupBy=[[#test.a]], aggr=[[SUM(#test.b)]]\
-        \n  TableScan: test";
-        assert_optimized_plan_eq(&plan, expected);
+        assert_optimized_plan_equal!(plan, @r"
+        Aggregate: groupBy=[[test.a]], aggr=[[sum(test.b)]]
+          TableScan: test
+        ")
     }
 
     #[test]
-    fn fliter_true_nested() {
-        let filter_expr = Expr::Literal(ScalarValue::Boolean(Some(true)));
+    fn filter_true_nested() -> Result<()> {
+        let filter_expr = lit(true);
 
-        let table_scan = test_table_scan().unwrap();
+        let table_scan = test_table_scan()?;
         let plan1 = LogicalPlanBuilder::from(table_scan.clone())
-            .aggregate(vec![col("a")], vec![sum(col("b"))])
-            .unwrap()
-            .build()
-            .unwrap();
+            .aggregate(vec![col("a")], vec![sum(col("b"))])?
+            .build()?;
         let plan = LogicalPlanBuilder::from(table_scan)
-            .aggregate(vec![col("a")], vec![sum(col("b"))])
-            .unwrap()
-            .filter(filter_expr)
-            .unwrap()
-            .union(plan1)
-            .unwrap()
-            .build()
-            .unwrap();
+            .aggregate(vec![col("a")], vec![sum(col("b"))])?
+            .filter(filter_expr)?
+            .union(plan1)?
+            .build()?;
 
         // Filter is removed
-        let expected = "Union\
-            \n  Aggregate: groupBy=[[#test.a]], aggr=[[SUM(#test.b)]]\
-            \n    TableScan: test\
-            \n  Aggregate: groupBy=[[#test.a]], aggr=[[SUM(#test.b)]]\
-            \n    TableScan: test";
-        assert_optimized_plan_eq(&plan, expected);
+        assert_optimized_plan_equal!(plan, @r"
+        Union
+          Aggregate: groupBy=[[test.a]], aggr=[[sum(test.b)]]
+            TableScan: test
+          Aggregate: groupBy=[[test.a]], aggr=[[sum(test.b)]]
+            TableScan: test
+        ")
+    }
+
+    #[test]
+    fn filter_from_subquery() -> Result<()> {
+        // SELECT a FROM (SELECT a FROM test WHERE FALSE) WHERE TRUE
+
+        let false_filter = lit(false);
+        let table_scan = test_table_scan()?;
+        let plan1 = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("a")])?
+            .filter(false_filter)?
+            .build()?;
+
+        let true_filter = lit(true);
+        let plan = LogicalPlanBuilder::from(plan1)
+            .project(vec![col("a")])?
+            .filter(true_filter)?
+            .build()?;
+
+        // Filter is removed
+        assert_optimized_plan_equal!(plan, @r"
+        Projection: test.a
+          EmptyRelation: rows=0
+        ")
     }
 }

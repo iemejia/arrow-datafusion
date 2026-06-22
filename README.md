@@ -17,102 +17,150 @@
   under the License.
 -->
 
-# DataFusion
+# Apache DataFusion
 
-<img src="docs/source/_static/images/DataFusion-Logo-Background-White.svg" width="256"/>
+[![Crates.io][crates-badge]][crates-url]
+[![Apache licensed][license-badge]][license-url]
+[![Build Status][actions-badge]][actions-url]
+![Commit Activity][commit-activity-badge]
+[![Open Issues][open-issues-badge]][open-issues-url]
+[![Pending PRs][pending-pr-badge]][pending-pr-url]
+[![Discord chat][discord-badge]][discord-url]
+[![Linkedin][linkedin-badge]][linkedin-url]
+![Crates.io MSRV][msrv-badge]
 
-DataFusion is an extensible query planning, optimization, and execution framework, written in
-Rust, that uses [Apache Arrow](https://arrow.apache.org) as its
-in-memory format.
+[crates-badge]: https://img.shields.io/crates/v/datafusion.svg
+[crates-url]: https://crates.io/crates/datafusion
+[license-badge]: https://img.shields.io/badge/license-Apache%20v2-blue.svg
+[license-url]: https://github.com/apache/datafusion/blob/main/LICENSE.txt
+[actions-badge]: https://github.com/apache/datafusion/actions/workflows/rust.yml/badge.svg
+[actions-url]: https://github.com/apache/datafusion/actions?query=branch%3Amain
+[discord-badge]: https://img.shields.io/badge/Chat-Discord-purple
+[discord-url]: https://discord.com/invite/Qw5gKqHxUM
+[commit-activity-badge]: https://img.shields.io/github/commit-activity/m/apache/datafusion
+[open-issues-badge]: https://img.shields.io/github/issues-raw/apache/datafusion
+[open-issues-url]: https://github.com/apache/datafusion/issues
+[pending-pr-badge]: https://img.shields.io/github/issues-search/apache/datafusion?query=is%3Apr+is%3Aopen+draft%3Afalse+review%3Arequired+status%3Asuccess&label=Pending%20PRs&logo=github
+[pending-pr-url]: https://github.com/apache/datafusion/pulls?q=is%3Apr+is%3Aopen+draft%3Afalse+review%3Arequired+status%3Asuccess+sort%3Aupdated-desc
+[linkedin-badge]: https://img.shields.io/badge/Follow-Linkedin-blue
+[linkedin-url]: https://www.linkedin.com/company/apache-datafusion/
+[msrv-badge]: https://img.shields.io/crates/msrv/datafusion?label=Min%20Rust%20Version
 
-## Features
+[Website](https://datafusion.apache.org/) |
+[API Docs](https://docs.rs/datafusion/latest/datafusion/) |
+[Chat](https://discord.com/channels/885562378132000778/885562378132000781)
 
-- SQL query planner with support for multiple SQL dialects
-- DataFrame API
-- Parquet, CSV, JSON, and Avro file formats are supported natively. Custom
-  file formats can be supported by implementing a `TableProvider` trait.
-- Supports popular object stores, including AWS S3, Azure Blob
-  Storage, and Google Cloud Storage. There are extension points for implementing
-  custom object stores.
+<a href="https://datafusion.apache.org/">
+  <img src="https://github.com/apache/datafusion/raw/HEAD/docs/source/_static/images/2x_bgwhite_original.png" width="512" alt="logo"/>
+</a>
 
-## Use Cases
+DataFusion is an extensible query engine written in [Rust] that
+uses [Apache Arrow] as its in-memory format.
 
-DataFusion is modular in design with many extension points and can be
-used without modification as an embedded query engine and can also provide
-a foundation for building new systems. Here are some example use cases:
+This crate provides libraries and binaries for developers building fast and
+feature-rich database and analytic systems, customized for particular workloads.
+See [use cases] for examples. The following related subprojects target end users:
 
-- DataFusion can be used as a SQL query planner and query optimizer, providing
-  optimized logical plans that can then be mapped to other execution engines.
-- DataFusion is used to create modern, fast and efficient data
-  pipelines, ETL processes, and database systems, which need the
-  performance of Rust and Apache Arrow and want to provide their users
-  the convenience of an SQL interface or a DataFrame API.
+- [DataFusion Python](https://github.com/apache/datafusion-python/) offers a Python interface for SQL and DataFrame
+  queries.
+- [DataFusion Java](https://github.com/apache/datafusion-java/) offers a Java interface for SQL and DataFrame
+  queries.
+- [DataFusion Comet](https://github.com/apache/datafusion-comet/) is an accelerator for Apache Spark based on
+  DataFusion.
 
-## Why DataFusion?
+"Out of the box,"
+DataFusion offers [SQL](https://datafusion.apache.org/user-guide/sql/index.html) and [DataFrame](https://datafusion.apache.org/user-guide/dataframe.html) APIs, excellent [performance],
+built-in support for CSV, Parquet, JSON, and Avro, extensive customization, and
+a great community.
 
-- _High Performance_: Leveraging Rust and Arrow's memory model, DataFusion achieves very high performance
-- _Easy to Connect_: Being part of the Apache Arrow ecosystem (Arrow, Parquet and Flight), DataFusion works well with the rest of the big data ecosystem
-- _Easy to Embed_: Allowing extension at almost any point in its design, DataFusion can be tailored for your specific use case
-- _High Quality_: Extensively tested, both by itself and with the rest of the Arrow ecosystem, DataFusion can be used as the foundation for production systems.
+DataFusion features a full query planner, a columnar, streaming, multi-threaded,
+vectorized execution engine, and partitioned data sources. You can
+customize DataFusion at almost all points including additional data sources,
+query languages, functions, custom operators and more.
+See the [Architecture] section for more details.
 
-## DataFusion Community Extensions
+[rust]: http://rustlang.org
+[apache arrow]: https://arrow.apache.org
+[use cases]: https://datafusion.apache.org/user-guide/introduction.html#use-cases
+[python bindings]: https://github.com/apache/datafusion-python
+[performance]: https://benchmark.clickhouse.com/
+[architecture]: https://datafusion.apache.org/contributor-guide/architecture.html
 
-There are a number of community projects that extend DataFusion or provide integrations with other systems.
+Here are links to important resources:
 
-### Language Bindings
+- [Project Site](https://datafusion.apache.org/)
+- [Installation](https://datafusion.apache.org/user-guide/cli/installation.html)
+- [Rust Getting Started](https://datafusion.apache.org/user-guide/example-usage.html)
+- [Rust DataFrame API](https://datafusion.apache.org/user-guide/dataframe.html)
+- [Rust API docs](https://docs.rs/datafusion/latest/datafusion)
+- [Rust Examples](https://github.com/apache/datafusion/tree/main/datafusion-examples)
+- [Python DataFrame API](https://arrow.apache.org/datafusion-python/)
+- [Architecture](https://docs.rs/datafusion/latest/datafusion/index.html#architecture)
 
-- [datafusion-c](https://github.com/datafusion-contrib/datafusion-c)
-- [datafusion-python](https://github.com/datafusion-contrib/datafusion-python)
-- [datafusion-ruby](https://github.com/datafusion-contrib/datafusion-ruby)
-- [datafusion-java](https://github.com/datafusion-contrib/datafusion-java)
+## What can you do with this crate?
 
-### Integrations
+DataFusion is great for building projects such as domain-specific query engines, new database platforms and data pipelines, query languages and more.
+It lets you start quickly from a fully working engine, and then customize those features specific to your needs. See the [list of known users](https://datafusion.apache.org/user-guide/introduction.html#known-users).
 
-- [datafusion-bigtable](https://github.com/datafusion-contrib/datafusion-bigtable)
-- [datafusion-catalogprovider-glue](https://github.com/datafusion-contrib/datafusion-catalogprovider-glue)
-- [datafusion-substrait](https://github.com/datafusion-contrib/datafusion-substrait)
+## Contributing to DataFusion
 
-## Known Uses
+Please see the [contributor guide] and [communication] pages for more information.
 
-Here are some of the projects known to use DataFusion:
+We discuss our [roadmap] via GitHub issues and invite you
+to join the conversation. The current discussion is the
+[DataFusion 2026 Q3-Q4 Roadmap Discussion].
 
-- [Ballista](https://github.com/apache/arrow-ballista) Distributed SQL Query Engine
-- [Blaze](https://github.com/blaze-init/blaze) Spark accelerator with DataFusion at its core
-- [CeresDB](https://github.com/CeresDB/ceresdb) Distributed Time-Series Database
-- [Cloudfuse Buzz](https://github.com/cloudfuse-io/buzz-rust)
-- [CnosDB](https://github.com/cnosdb/cnosdb) Open Source Distributed Time Series Database
-- [Cube Store](https://github.com/cube-js/cube.js/tree/master/rust)
-- [datafusion-tui](https://github.com/datafusion-contrib/datafusion-tui) Text UI for DataFusion
-- [delta-rs](https://github.com/delta-io/delta-rs) Native Rust implementation of Delta Lake
-- [Flock](https://github.com/flock-lab/flock)
-- [InfluxDB IOx](https://github.com/influxdata/influxdb_iox) Time Series Database
-- [qv](https://github.com/timvw/qv) Quickly view your data
-- [ROAPI](https://github.com/roapi/roapi)
-- [Tensorbase](https://github.com/tensorbase/tensorbase)
-- [VegaFusion](https://vegafusion.io/) Server-side acceleration for the [Vega](https://vega.github.io/) visualization grammar
+[contributor guide]: https://datafusion.apache.org/contributor-guide
+[communication]: https://datafusion.apache.org/contributor-guide/communication.html
+[roadmap]: https://datafusion.apache.org/contributor-guide/roadmap.html
+[datafusion 2026 q3-q4 roadmap discussion]: https://github.com/apache/datafusion/issues/22882
 
-(if you know of another project, please submit a PR to add a link!)
+## Crate features
 
-## Example Usage
+This crate has several [features] which can be specified in your `Cargo.toml`.
 
-Please see [example usage](https://arrow.apache.org/datafusion/user-guide/example-usage.html) to find how to use DataFusion.
+[features]: https://doc.rust-lang.org/cargo/reference/features.html
 
-## Roadmap
+Default features:
 
-Please see [Roadmap](docs/source/specification/roadmap.md) for information of where the project is headed.
+- `nested_expressions`: functions for working with nested types such as `array_to_string`
+- `compression`: reading files compressed with `xz2`, `bzip2`, `flate2`, and `zstd`
+- `crypto_expressions`: cryptographic functions such as `md5` and `sha256`
+- `datetime_expressions`: date and time functions such as `to_timestamp`
+- `encoding_expressions`: `encode` and `decode` functions
+- `parquet`: support for reading the [Apache Parquet] format
+- `sql`: support for SQL parsing and planning
+- `regex_expressions`: regular expression functions, such as `regexp_match`
+- `unicode_expressions`: include Unicode-aware functions such as `character_length`
+- `unparser`: enables support to reverse LogicalPlans back into SQL
+- `recursive_protection`: uses [recursive](https://docs.rs/recursive/latest/recursive/) for stack overflow protection.
 
-## Architecture Overview
+Optional features:
 
-There is no formal document describing DataFusion's architecture yet, but the following presentations offer a good overview of its different components and how they interact together.
+- `avro`: support for reading the [Apache Avro] format
+- `backtrace`: include backtrace information in error messages
+- `parquet_encryption`: support for using [Parquet Modular Encryption]
+- `serde`: enable arrow-schema's `serde` feature
 
-- (July 2022): DataFusion and Arrow: Supercharge Your Data Analytical Tool with a Rusty Query Engine: [recording](https://www.youtube.com/watch?v=Rii1VTn3seQ)
-- (March 2021): The DataFusion architecture is described in _Query Engine Design and the Rust-Based DataFusion in Apache Arrow_: [recording](https://www.youtube.com/watch?v=K6eCAVEk4kU) (DataFusion content starts [~ 15 minutes in](https://www.youtube.com/watch?v=K6eCAVEk4kU&t=875s)) and [slides](https://www.slideshare.net/influxdata/influxdb-iox-tech-talks-query-engine-design-and-the-rustbased-datafusion-in-apache-arrow-244161934)
-- (February 2021): How DataFusion is used within the Ballista Project is described in \*Ballista: Distributed Compute with Rust and Apache Arrow: [recording](https://www.youtube.com/watch?v=ZZHQaOap9pQ)
+[apache avro]: https://avro.apache.org/
+[apache parquet]: https://parquet.apache.org/
+[parquet modular encryption]: https://parquet.apache.org/docs/file-format/data-pages/encryption/
 
-## User's guide
+## DataFusion API Evolution and Deprecation Guidelines
 
-Please see [User Guide](https://arrow.apache.org/datafusion/) for more information about DataFusion.
+Public methods in Apache DataFusion evolve over time: while we try to maintain a
+stable API, we also improve the API over time. As a result, we typically
+deprecate methods before removing them, according to the [deprecation guidelines].
 
-## Contribution Guide
+[deprecation guidelines]: https://datafusion.apache.org/contributor-guide/api-health.html
 
-Please see [Contribution Guide](CONTRIBUTING.md) for information about contributing to DataFusion.
+## Dependencies and `Cargo.lock`
+
+Following the [guidance] on committing `Cargo.lock` files, this project commits
+its `Cargo.lock` file.
+
+CI uses the committed `Cargo.lock` file, and dependencies are updated regularly
+using [Dependabot] PRs.
+
+[guidance]: https://blog.rust-lang.org/2023/08/29/committing-lockfiles.html
+[dependabot]: https://docs.github.com/en/code-security/dependabot/working-with-dependabot

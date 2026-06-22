@@ -15,5 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! DataFusion error types
-pub use datafusion_common::{DataFusionError, Result};
+//! DataFusion error type [`DataFusionError`] and [`Result`].
+pub use datafusion_common::{DataFusionError, Result, SharedResult};

@@ -15,333 +15,338 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Collection of utility functions that are leveraged by the query optimizer rules
+//! Utility functions leveraged by the query optimizer rules
 
-use crate::{OptimizerConfig, OptimizerRule};
-use datafusion_common::Result;
-use datafusion_common::{plan_err, Column, DFSchemaRef};
-use datafusion_expr::expr_visitor::{ExprVisitable, ExpressionVisitor, Recursion};
-use datafusion_expr::{
-    and, col, combine_filters,
-    logical_plan::{Filter, LogicalPlan},
-    utils::from_plan,
-    Expr, Operator,
-};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+use crate::analyzer::type_coercion::TypeCoercionRewriter;
+use arrow::array::{Array, RecordBatch, new_null_array};
+use arrow::datatypes::{DataType, Field, Schema};
+use datafusion_common::TableReference;
+use datafusion_common::cast::as_boolean_array;
+use datafusion_common::tree_node::{TransformedResult, TreeNode, TreeNodeRecursion};
+use datafusion_common::{Column, DFSchema, Result, ScalarValue};
+use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::expr::{Exists, InSubquery, SetComparison};
+use datafusion_expr::expr_rewriter::replace_col;
+use datafusion_expr::{ColumnarValue, Expr, logical_plan::LogicalPlan};
+use datafusion_physical_expr::create_physical_expr;
+use log::{debug, trace};
 use std::sync::Arc;
 
-/// Convenience rule for writing optimizers: recursively invoke
-/// optimize on plan's children and then return a node of the same
-/// type. Useful for optimizer rules which want to leave the type
-/// of plan unchanged but still apply to the children.
-/// This also handles the case when the `plan` is a [`LogicalPlan::Explain`].
-pub fn optimize_children(
-    optimizer: &impl OptimizerRule,
-    plan: &LogicalPlan,
-    optimizer_config: &mut OptimizerConfig,
-) -> Result<LogicalPlan> {
-    let new_exprs = plan.expressions();
-    let new_inputs = plan
-        .inputs()
-        .into_iter()
-        .map(|plan| optimizer.optimize(plan, optimizer_config))
-        .collect::<Result<Vec<_>>>()?;
+/// Re-export of `NamesPreserver` for backwards compatibility,
+/// as it was initially placed here and then moved elsewhere.
+pub use datafusion_expr::expr_rewriter::NamePreserver;
 
-    from_plan(plan, &new_exprs, &new_inputs)
+/// Invokes `f` with the index, within `schema`, of every column referenced by
+/// `expr` — including columns reached through a correlated subquery's outer
+/// references. Columns absent from `schema` are skipped.
+///
+/// A subquery's own plan is intentionally not traversed: its internal columns
+/// index into its own schema, not `schema`; only the outer (correlated) columns
+/// it references from `schema` are relevant. The comparison expression of an
+/// `IN`/set-comparison subquery is reached by the normal expression walk.
+///
+/// This is the shared primitive behind the top-down "which of a node's output
+/// columns does an ancestor still need" analyses, namely
+/// [`OptimizeProjections`](crate::optimize_projections::OptimizeProjections)
+/// and [`EliminateJoin`](crate::eliminate_join::EliminateJoin). The two keep
+/// their own required-index containers (an ordered set vs. a hash set), so this
+/// reports indices through a callback rather than populating a shared type.
+pub(crate) fn for_each_referenced_index(
+    expr: &Expr,
+    schema: &DFSchema,
+    mut f: impl FnMut(usize),
+) -> Result<()> {
+    visit_referenced_indices(expr, schema, &mut f)
 }
 
-/// converts "A AND B AND C" => [A, B, C]
-pub fn split_conjunction<'a>(predicate: &'a Expr, predicates: &mut Vec<&'a Expr>) {
-    match predicate {
-        Expr::BinaryExpr {
-            right,
-            op: Operator::And,
-            left,
-        } => {
-            split_conjunction(left, predicates);
-            split_conjunction(right, predicates);
-        }
-        Expr::Alias(expr, _) => {
-            split_conjunction(expr, predicates);
-        }
-        other => predicates.push(other),
-    }
-}
-
-/// Recursively scans a slice of expressions for any `Or` operators
-///
-/// # Arguments
-///
-/// * `predicates` - the expressions to scan
-///
-/// # Return value
-///
-/// A PlanError if a disjunction is found
-pub fn verify_not_disjunction(predicates: &[&Expr]) -> Result<()> {
-    struct DisjunctionVisitor {}
-
-    impl ExpressionVisitor for DisjunctionVisitor {
-        fn pre_visit(self, expr: &Expr) -> Result<Recursion<Self>> {
-            match expr {
-                Expr::BinaryExpr {
-                    left: _,
-                    op: Operator::Or,
-                    right: _,
-                } => {
-                    plan_err!("Optimizing disjunctions not supported!")
+fn visit_referenced_indices(
+    expr: &Expr,
+    schema: &DFSchema,
+    f: &mut dyn FnMut(usize),
+) -> Result<()> {
+    expr.apply(|expr| {
+        match expr {
+            Expr::Column(column) | Expr::OuterReferenceColumn(_, column) => {
+                if let Some(idx) = schema.maybe_index_of_column(column) {
+                    f(idx);
                 }
-                _ => Ok(Recursion::Continue(self)),
             }
+            Expr::Exists(Exists { subquery, .. })
+            | Expr::InSubquery(InSubquery { subquery, .. })
+            | Expr::SetComparison(SetComparison { subquery, .. })
+            | Expr::ScalarSubquery(subquery) => {
+                for outer in &subquery.outer_ref_columns {
+                    visit_referenced_indices(outer, schema, f)?;
+                }
+            }
+            _ => {}
         }
-    }
-
-    for predicate in predicates.iter() {
-        predicate.accept(DisjunctionVisitor {})?;
-    }
-
+        Ok(TreeNodeRecursion::Continue)
+    })?;
     Ok(())
 }
 
-/// returns a new [LogicalPlan] that wraps `plan` in a [LogicalPlan::Filter] with
-/// its predicate be all `predicates` ANDed.
-pub fn add_filter(plan: LogicalPlan, predicates: &[&Expr]) -> LogicalPlan {
-    // reduce filters to a single filter with an AND
-    let predicate = predicates
+/// Returns true if `expr` contains all columns in `schema_cols`
+pub(crate) fn has_all_column_refs(
+    expr: &Expr,
+    schema_cols: &HashSet<ColumnReference>,
+) -> bool {
+    let column_refs = expr.column_refs();
+    // note can't use HashSet::intersect because of different types (owned vs References)
+    column_refs
         .iter()
-        .skip(1)
-        .fold(predicates[0].clone(), |acc, predicate| {
-            and(acc, (*predicate).to_owned())
-        });
-
-    LogicalPlan::Filter(Filter {
-        predicate,
-        input: Arc::new(plan),
-    })
+        .filter(|c| {
+            schema_cols.contains(&ColumnReference::new(c.relation.as_ref(), c.name()))
+        })
+        .count()
+        == column_refs.len()
 }
 
-/// Looks for correlating expressions: equality expressions with one field from the subquery, and
-/// one not in the subquery (closed upon from outer scope)
-///
-/// # Arguments
-///
-/// * `exprs` - List of expressions that may or may not be joins
-/// * `fields` - HashSet of fully qualified (table.col) fields in subquery schema
-///
-/// # Return value
-///
-/// Tuple of (expressions containing joins, remaining non-join expressions)
-pub fn find_join_exprs(
-    exprs: Vec<&Expr>,
-    schema: &DFSchemaRef,
-) -> Result<(Vec<Expr>, Vec<Expr>)> {
-    let fields: HashSet<_> = schema
-        .fields()
+pub(crate) fn replace_qualified_name(
+    expr: Expr,
+    cols: &BTreeSet<Column>,
+    subquery_alias: &str,
+) -> Result<Expr> {
+    let alias_cols: Vec<Column> = cols
         .iter()
-        .map(|it| it.qualified_name())
+        .map(|col| Column::new(Some(subquery_alias), &col.name))
         .collect();
+    let replace_map: HashMap<&Column, &Column> =
+        cols.iter().zip(alias_cols.iter()).collect();
 
-    let mut joins = vec![];
-    let mut others = vec![];
-    for filter in exprs.iter() {
-        let (left, op, right) = match filter {
-            Expr::BinaryExpr { left, op, right } => (*left.clone(), *op, *right.clone()),
-            _ => {
-                others.push((*filter).clone());
-                continue;
-            }
-        };
-        let left = match left {
-            Expr::Column(c) => c,
-            _ => {
-                others.push((*filter).clone());
-                continue;
-            }
-        };
-        let right = match right {
-            Expr::Column(c) => c,
-            _ => {
-                others.push((*filter).clone());
-                continue;
-            }
-        };
-        if fields.contains(&left.flat_name()) && fields.contains(&right.flat_name()) {
-            others.push((*filter).clone());
-            continue; // both columns present (none closed-upon)
-        }
-        if !fields.contains(&left.flat_name()) && !fields.contains(&right.flat_name()) {
-            others.push((*filter).clone());
-            continue; // neither column present (syntax error?)
-        }
-        match op {
-            Operator::Eq => {}
-            Operator::NotEq => {}
-            _ => {
-                plan_err!(format!("can't optimize {} column comparison", op))?;
-            }
-        }
+    replace_col(expr, &replace_map)
+}
 
-        joins.push((*filter).clone())
+/// Column reference to avoid copying string around
+#[derive(PartialEq, Eq, Hash, Debug)]
+pub(crate) struct ColumnReference<'a> {
+    pub relation: Option<&'a TableReference>,
+    pub name: &'a str,
+}
+
+impl<'a> ColumnReference<'a> {
+    pub fn new(relation: Option<&'a TableReference>, name: &'a str) -> Self {
+        Self { relation, name }
     }
 
-    Ok((joins, others))
+    pub fn new_unqualified(name: &'a str) -> Self {
+        Self {
+            relation: None,
+            name,
+        }
+    }
 }
 
-/// Extracts correlating columns from expressions
-///
-/// # Arguments
-///
-/// * `exprs` - List of expressions that correlate a subquery to an outer scope
-/// * `fields` - HashSet of fully qualified (table.col) fields in subquery schema
-/// * `include_negated` - true if `NotEq` counts as a join operator
-///
-/// # Return value
-///
-/// Tuple of (outer-scope cols, subquery cols, non-correlation expressions)
-pub fn exprs_to_join_cols(
-    exprs: &[Expr],
-    schema: &DFSchemaRef,
-    include_negated: bool,
-) -> Result<(Vec<Column>, Vec<Column>, Option<Expr>)> {
-    let fields: HashSet<_> = schema
-        .fields()
+/// Returns references to all columns in the schema
+pub(crate) fn schema_columns<'a>(schema: &'a DFSchema) -> HashSet<ColumnReference<'a>> {
+    schema
         .iter()
-        .map(|it| it.qualified_name())
-        .collect();
+        .flat_map(|(qualifier, field)| {
+            [
+                ColumnReference::new(qualifier, field.name()),
+                // we need to push down filter using unqualified column as well
+                ColumnReference::new_unqualified(field.name()),
+            ]
+        })
+        .collect::<HashSet<_>>()
+}
 
-    let mut joins: Vec<(String, String)> = vec![];
-    let mut others: Vec<Expr> = vec![];
-    for filter in exprs.iter() {
-        let (left, op, right) = match filter {
-            Expr::BinaryExpr { left, op, right } => (*left.clone(), *op, *right.clone()),
-            _ => plan_err!("Invalid correlation expression!")?,
-        };
-        match op {
-            Operator::Eq => {}
-            Operator::NotEq => {
-                if !include_negated {
-                    others.push((*filter).clone());
-                    continue;
+/// Log the plan in debug/tracing mode after some part of the optimizer runs
+pub fn log_plan(description: &str, plan: &LogicalPlan) {
+    debug!("{description}:\n{}\n", plan.display_indent());
+    trace!("{description}::\n{}\n", plan.display_indent_schema());
+}
+
+/// Determine whether a predicate can restrict NULLs. e.g.
+/// `c0 > 8` return true;
+/// `c0 IS NULL` return false.
+pub fn is_restrict_null_predicate<'a>(
+    predicate: Expr,
+    join_cols_of_predicate: impl IntoIterator<Item = &'a Column>,
+) -> Result<bool> {
+    if matches!(predicate, Expr::Column(_)) {
+        return Ok(true);
+    }
+
+    // If result is single `true`, return false;
+    // If result is single `NULL` or `false`, return true;
+    Ok(
+        match evaluate_expr_with_null_column(predicate, join_cols_of_predicate)? {
+            ColumnarValue::Array(array) => {
+                if array.len() == 1 {
+                    let boolean_array = as_boolean_array(&array)?;
+                    boolean_array.is_null(0) || !boolean_array.value(0)
+                } else {
+                    false
                 }
             }
-            _ => plan_err!(format!("Correlation operator unsupported: {}", op))?,
-        }
-        let left = left.try_into_col()?;
-        let right = right.try_into_col()?;
-        let sorted = if fields.contains(&left.flat_name()) {
-            (right.flat_name(), left.flat_name())
-        } else {
-            (left.flat_name(), right.flat_name())
-        };
-        joins.push(sorted);
+            ColumnarValue::Scalar(scalar) => matches!(
+                scalar,
+                ScalarValue::Boolean(None) | ScalarValue::Boolean(Some(false))
+            ),
+        },
+    )
+}
+
+/// Determines if an expression will always evaluate to null.
+/// `c0 + 8` return true
+/// `c0 IS NULL` return false
+/// `CASE WHEN c0 > 1 then 0 else 1` return false
+pub fn evaluates_to_null<'a>(
+    predicate: Expr,
+    null_columns: impl IntoIterator<Item = &'a Column>,
+) -> Result<bool> {
+    if matches!(predicate, Expr::Column(_)) {
+        return Ok(true);
     }
 
-    let (left_cols, right_cols): (Vec<_>, Vec<_>) = joins
+    Ok(
+        match evaluate_expr_with_null_column(predicate, null_columns)? {
+            ColumnarValue::Array(_) => false,
+            ColumnarValue::Scalar(scalar) => scalar.is_null(),
+        },
+    )
+}
+
+fn evaluate_expr_with_null_column<'a>(
+    predicate: Expr,
+    null_columns: impl IntoIterator<Item = &'a Column>,
+) -> Result<ColumnarValue> {
+    static DUMMY_COL_NAME: &str = "?";
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        DUMMY_COL_NAME,
+        DataType::Null,
+        true,
+    )]));
+    let input_schema = DFSchema::try_from(Arc::clone(&schema))?;
+    let column = new_null_array(&DataType::Null, 1);
+    let input_batch = RecordBatch::try_new(schema, vec![column])?;
+    let execution_props = ExecutionProps::default();
+    let null_column = Column::from_name(DUMMY_COL_NAME);
+
+    let join_cols_to_replace = null_columns
         .into_iter()
-        .map(|(l, r)| (Column::from(l.as_str()), Column::from(r.as_str())))
-        .unzip();
-    let pred = combine_filters(&others);
+        .map(|column| (column, &null_column))
+        .collect::<HashMap<_, _>>();
 
-    Ok((left_cols, right_cols, pred))
+    let replaced_predicate = replace_col(predicate, &join_cols_to_replace)?;
+    let coerced_predicate = coerce(replaced_predicate, &input_schema)?;
+    create_physical_expr(&coerced_predicate, &input_schema, &execution_props)?
+        .evaluate(&input_batch)
 }
 
-/// Returns the first (and only) element in a slice, or an error
-///
-/// # Arguments
-///
-/// * `slice` - The slice to extract from
-///
-/// # Return value
-///
-/// The first element, or an error
-pub fn only_or_err<T>(slice: &[T]) -> Result<&T> {
-    match slice {
-        [it] => Ok(it),
-        [] => plan_err!("No items found!"),
-        _ => plan_err!("More than one item found!"),
-    }
-}
-
-/// Merge and deduplicate two sets Column slices
-///
-/// # Arguments
-///
-/// * `a` - A tuple of slices of Columns
-/// * `b` - A tuple of slices of Columns
-///
-/// # Return value
-///
-/// The deduplicated union of the two slices
-pub fn merge_cols(
-    a: (&[Column], &[Column]),
-    b: (&[Column], &[Column]),
-) -> (Vec<Column>, Vec<Column>) {
-    let e =
-        a.0.iter()
-            .map(|it| it.flat_name())
-            .chain(a.1.iter().map(|it| it.flat_name()))
-            .map(|it| Column::from(it.as_str()));
-    let f =
-        b.0.iter()
-            .map(|it| it.flat_name())
-            .chain(b.1.iter().map(|it| it.flat_name()))
-            .map(|it| Column::from(it.as_str()));
-    let mut g = e.zip(f).collect::<Vec<_>>();
-    g.dedup();
-    g.into_iter().unzip()
-}
-
-/// Change the relation on a slice of Columns
-///
-/// # Arguments
-///
-/// * `new_table` - The table/relation for the new columns
-/// * `cols` - A slice of Columns
-///
-/// # Return value
-///
-/// A new slice of columns, now belonging to the new table
-pub fn swap_table(new_table: &str, cols: &[Column]) -> Vec<Column> {
-    cols.iter()
-        .map(|it| Column {
-            relation: Some(new_table.to_string()),
-            name: it.name.clone(),
-        })
-        .collect()
-}
-
-pub fn alias_cols(cols: &[Column]) -> Vec<Expr> {
-    cols.iter()
-        .map(|it| col(it.flat_name().as_str()).alias(it.name.as_str()))
-        .collect()
+fn coerce(expr: Expr, schema: &DFSchema) -> Result<Expr> {
+    let mut expr_rewrite = TypeCoercionRewriter { schema };
+    expr.rewrite(&mut expr_rewrite).data()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::DataType;
-    use datafusion_common::Column;
-    use datafusion_expr::{col, utils::expr_to_columns};
-    use std::collections::HashSet;
+    use datafusion_expr::{Operator, binary_expr, case, col, in_list, is_null, lit};
 
     #[test]
-    fn test_collect_expr() -> Result<()> {
-        let mut accum: HashSet<Column> = HashSet::new();
-        expr_to_columns(
-            &Expr::Cast {
-                expr: Box::new(col("a")),
-                data_type: DataType::Float64,
-            },
-            &mut accum,
-        )?;
-        expr_to_columns(
-            &Expr::Cast {
-                expr: Box::new(col("a")),
-                data_type: DataType::Float64,
-            },
-            &mut accum,
-        )?;
-        assert_eq!(1, accum.len());
-        assert!(accum.contains(&Column::from_name("a")));
+    fn expr_is_restrict_null_predicate() -> Result<()> {
+        let test_cases = vec![
+            // a
+            (col("a"), true),
+            // a IS NULL
+            (is_null(col("a")), false),
+            // a IS NOT NULL
+            (Expr::IsNotNull(Box::new(col("a"))), true),
+            // a = NULL
+            (
+                binary_expr(
+                    col("a"),
+                    Operator::Eq,
+                    Expr::Literal(ScalarValue::Null, None),
+                ),
+                true,
+            ),
+            // a > 8
+            (binary_expr(col("a"), Operator::Gt, lit(8i64)), true),
+            // a <= 8
+            (binary_expr(col("a"), Operator::LtEq, lit(8i32)), true),
+            // CASE a WHEN 1 THEN true WHEN 0 THEN false ELSE NULL END
+            (
+                case(col("a"))
+                    .when(lit(1i64), lit(true))
+                    .when(lit(0i64), lit(false))
+                    .otherwise(lit(ScalarValue::Null))?,
+                true,
+            ),
+            // CASE a WHEN 1 THEN true ELSE false END
+            (
+                case(col("a"))
+                    .when(lit(1i64), lit(true))
+                    .otherwise(lit(false))?,
+                true,
+            ),
+            // CASE a WHEN 0 THEN false ELSE true END
+            (
+                case(col("a"))
+                    .when(lit(0i64), lit(false))
+                    .otherwise(lit(true))?,
+                false,
+            ),
+            // (CASE a WHEN 0 THEN false ELSE true END) OR false
+            (
+                binary_expr(
+                    case(col("a"))
+                        .when(lit(0i64), lit(false))
+                        .otherwise(lit(true))?,
+                    Operator::Or,
+                    lit(false),
+                ),
+                false,
+            ),
+            // (CASE a WHEN 0 THEN true ELSE false END) OR false
+            (
+                binary_expr(
+                    case(col("a"))
+                        .when(lit(0i64), lit(true))
+                        .otherwise(lit(false))?,
+                    Operator::Or,
+                    lit(false),
+                ),
+                true,
+            ),
+            // a IN (1, 2, 3)
+            (
+                in_list(col("a"), vec![lit(1i64), lit(2i64), lit(3i64)], false),
+                true,
+            ),
+            // a NOT IN (1, 2, 3)
+            (
+                in_list(col("a"), vec![lit(1i64), lit(2i64), lit(3i64)], true),
+                true,
+            ),
+            // a IN (NULL)
+            (
+                in_list(
+                    col("a"),
+                    vec![Expr::Literal(ScalarValue::Null, None)],
+                    false,
+                ),
+                true,
+            ),
+            // a NOT IN (NULL)
+            (
+                in_list(col("a"), vec![Expr::Literal(ScalarValue::Null, None)], true),
+                true,
+            ),
+        ];
+
+        let column_a = Column::from_name("a");
+        for (predicate, expected) in test_cases {
+            let join_cols_of_predicate = std::iter::once(&column_a);
+            let actual =
+                is_restrict_null_predicate(predicate.clone(), join_cols_of_predicate)?;
+            assert_eq!(actual, expected, "{predicate}");
+        }
+
         Ok(())
     }
 }

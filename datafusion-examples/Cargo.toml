@@ -18,29 +18,61 @@
 [package]
 name = "datafusion-examples"
 description = "DataFusion usage examples"
-version = "5.0.0"
-homepage = "https://github.com/apache/arrow-datafusion"
-repository = "https://github.com/apache/arrow-datafusion"
-authors = ["Apache Arrow <dev@arrow.apache.org>"]
-license = "Apache-2.0"
-keywords = [ "arrow", "query", "sql" ]
-edition = "2021"
+keywords = ["arrow", "query", "sql"]
 publish = false
-rust-version = "1.59"
+readme = "README.md"
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+rust-version = { workspace = true }
 
-[[example]]
-name = "avro_sql"
-path = "examples/avro_sql.rs"
-required-features = ["datafusion/avro"]
+# Note: add additional linter rules in lib.rs.
+# Rust does not support workspace + new linter rules in subcrates yet
+# https://github.com/rust-lang/cargo/issues/13157
+[lints]
+workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+datafusion = { workspace = true, default-features = true, features = ["parquet_encryption"] }
+datafusion-common = { workspace = true }
+nom = "8.0.0"
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "parking_lot", "fs"] }
 
 [dev-dependencies]
-arrow-flight = { version = "20.0.0" }
-async-trait = "0.1.41"
-datafusion = { path = "../datafusion/core" }
-futures = "0.3"
-num_cpus = "1.13.0"
-prost = "0.11.0"
-serde = { version = "1.0.136", features = ["derive"] }
-serde_json = "1.0.82"
-tokio = { version = "1.0", features = ["macros", "rt", "rt-multi-thread", "sync", "parking_lot"] }
-tonic = "0.8"
+arrow-flight = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+# note only use main datafusion crate for examples
+base64 = "0.22.1"
+datafusion-expr = { workspace = true }
+datafusion-physical-expr-adapter = { workspace = true }
+datafusion-proto = { workspace = true }
+datafusion-sql = { workspace = true }
+env_logger = { workspace = true }
+futures = { workspace = true }
+insta = { workspace = true }
+log = { workspace = true }
+mimalloc = { version = "0.1", default-features = false }
+object_store = { workspace = true, features = ["aws", "http"] }
+prost = { workspace = true }
+rand = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+test-utils = { path = "../test-utils" }
+tonic = "0.14"
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3" }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(not(target_os = "windows"))'.dev-dependencies]
+nix = { version = "0.31.3", features = ["fs"] }

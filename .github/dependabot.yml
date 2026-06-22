@@ -20,9 +20,58 @@ updates:
   - package-ecosystem: cargo
     directory: "/"
     schedule:
-      interval: daily
+      interval: weekly
+    target-branch: main
+    labels: [auto-dependencies]
+    open-pull-requests-limit: 15
+    ignore:
+      # major version bumps of arrow* and parquet are handled manually
+      - dependency-name: "arrow*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "parquet"
+        update-types: ["version-update:semver-major"]
+    groups:
+      # minor and patch bumps of arrow* and parquet are grouped
+      arrow-parquet:
+        applies-to: version-updates
+        patterns:
+          - "arrow*"
+          - "parquet"
+        update-types:
+          - "minor"
+          - "patch"
+      proto:
+        applies-to: version-updates
+        patterns:
+          - "prost*"
+          - "pbjson*"
+
+        # Catch-all: group only minor/patch into a single PR,
+        # excluding deps we want always separate (and excluding arrow/parquet which have their own group)
+      all-other-cargo-deps:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "arrow*"
+          - "parquet"
+          - "object_store"
+          - "sqlparser"
+          - "prost*"
+          - "pbjson*"
+        update-types:
+          - "minor"
+          - "patch"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
     open-pull-requests-limit: 10
-    target-branch: master
+    labels: [auto-dependencies]
+  - package-ecosystem: "pip"
+    directory: "/docs"
+    schedule:
+      interval: "weekly"
     labels: [auto-dependencies]
   - package-ecosystem: "github-actions"
     directory: "/"

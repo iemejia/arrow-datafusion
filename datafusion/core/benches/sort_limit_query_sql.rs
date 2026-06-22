@@ -15,19 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[macro_use]
-extern crate criterion;
-use criterion::Criterion;
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 
+use datafusion::prelude::SessionConfig;
 use parking_lot::Mutex;
 use std::sync::Arc;
-
-extern crate arrow;
-extern crate datafusion;
 
 use arrow::datatypes::{DataType, Field, Schema};
 
@@ -36,9 +32,8 @@ use datafusion::execution::context::SessionContext;
 
 use tokio::runtime::Runtime;
 
-fn query(ctx: Arc<Mutex<SessionContext>>, sql: &str) {
-    let rt = Runtime::new().unwrap();
-
+#[expect(clippy::needless_pass_by_value)]
+fn query(ctx: Arc<Mutex<SessionContext>>, rt: &Runtime, sql: &str) {
     // execute the query
     let df = rt.block_on(ctx.lock().sql(sql)).unwrap();
     rt.block_on(df.collect()).unwrap();
@@ -64,7 +59,7 @@ fn create_context() -> Arc<Mutex<SessionContext>> {
 
     let testdata = datafusion::test_util::arrow_test_data();
 
-    let path = format!("{}/csv/aggregate_test_100.csv", testdata);
+    let path = format!("{testdata}/csv/aggregate_test_100.csv");
     let table_path = ListingTableUrl::parse(path).unwrap();
 
     // create CSV data source
@@ -85,8 +80,9 @@ fn create_context() -> Arc<Mutex<SessionContext>> {
 
     rt.block_on(async {
         // create local session context
-        let ctx = SessionContext::new();
-        ctx.state.write().config.target_partitions = 1;
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(1),
+        );
 
         let table_provider = Arc::new(csv.await);
         let mem_table = MemTable::load(table_provider, Some(partitions), &ctx.state())
@@ -97,16 +93,18 @@ fn create_context() -> Arc<Mutex<SessionContext>> {
         ctx_holder.lock().push(Arc::new(Mutex::new(ctx)))
     });
 
-    let ctx = ctx_holder.lock().get(0).unwrap().clone();
-    ctx
+    ctx_holder.lock().first().unwrap().clone()
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
+    let ctx = create_context();
+    let rt = Runtime::new().unwrap();
+
     c.bench_function("sort_and_limit_by_int", |b| {
-        let ctx = create_context();
         b.iter(|| {
             query(
                 ctx.clone(),
+                &rt,
                 "SELECT c1, c13, c6, c10 \
                  FROM aggregate_test_100 \
                  ORDER BY c6
@@ -116,10 +114,10 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
 
     c.bench_function("sort_and_limit_by_float", |b| {
-        let ctx = create_context();
         b.iter(|| {
             query(
                 ctx.clone(),
+                &rt,
                 "SELECT c1, c13, c12 \
                  FROM aggregate_test_100 \
                  ORDER BY c13
@@ -129,10 +127,10 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
 
     c.bench_function("sort_and_limit_lex_by_int", |b| {
-        let ctx = create_context();
         b.iter(|| {
             query(
                 ctx.clone(),
+                &rt,
                 "SELECT c1, c13, c6, c10 \
                  FROM aggregate_test_100 \
                  ORDER BY c6 DESC, c10 DESC
@@ -142,10 +140,10 @@ fn criterion_benchmark(c: &mut Criterion) {
     });
 
     c.bench_function("sort_and_limit_lex_by_string", |b| {
-        let ctx = create_context();
         b.iter(|| {
             query(
                 ctx.clone(),
+                &rt,
                 "SELECT c1, c13, c6, c10 \
                  FROM aggregate_test_100 \
                  ORDER BY c1, c13

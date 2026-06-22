@@ -16,115 +16,119 @@
 // under the License.
 
 //! Module containing helper methods for the various file formats
+//! See write.rs for write related helper methods
 
-/// default max records to scan to infer the schema
-pub const DEFAULT_SCHEMA_INFER_MAX_RECORD: usize = 1000;
-
-pub mod avro;
+pub mod arrow;
 pub mod csv;
 pub mod json;
+
+#[cfg(feature = "avro")]
+pub mod avro;
+
+#[cfg(feature = "parquet")]
 pub mod parquet;
 
-use std::any::Any;
-use std::fmt;
-use std::sync::Arc;
+pub mod options;
 
-use crate::arrow::datatypes::SchemaRef;
-use crate::error::Result;
-use crate::logical_plan::Expr;
-use crate::physical_plan::file_format::FileScanConfig;
-use crate::physical_plan::{ExecutionPlan, Statistics};
-
-use async_trait::async_trait;
-use object_store::{ObjectMeta, ObjectStore};
-
-/// This trait abstracts all the file format specific implementations
-/// from the `TableProvider`. This helps code re-utilization across
-/// providers that support the the same file formats.
-#[async_trait]
-pub trait FileFormat: Send + Sync + fmt::Debug {
-    /// Returns the table provider as [`Any`](std::any::Any) so that it can be
-    /// downcast to a specific implementation.
-    fn as_any(&self) -> &dyn Any;
-
-    /// Infer the common schema of the provided objects. The objects will usually
-    /// be analysed up to a given number of records or files (as specified in the
-    /// format config) then give the estimated common schema. This might fail if
-    /// the files have schemas that cannot be merged.
-    async fn infer_schema(
-        &self,
-        store: &Arc<dyn ObjectStore>,
-        objects: &[ObjectMeta],
-    ) -> Result<SchemaRef>;
-
-    /// Infer the statistics for the provided object. The cost and accuracy of the
-    /// estimated statistics might vary greatly between file formats.
-    ///
-    /// `table_schema` is the (combined) schema of the overall table
-    /// and may be a superset of the schema contained in this file.
-    ///
-    /// TODO: should the file source return statistics for only columns referred to in the table schema?
-    async fn infer_stats(
-        &self,
-        store: &Arc<dyn ObjectStore>,
-        table_schema: SchemaRef,
-        object: &ObjectMeta,
-    ) -> Result<Statistics>;
-
-    /// Take a list of files and convert it to the appropriate executor
-    /// according to this file format.
-    async fn create_physical_plan(
-        &self,
-        conf: FileScanConfig,
-        filters: &[Expr],
-    ) -> Result<Arc<dyn ExecutionPlan>>;
-}
+pub use datafusion_datasource::file_compression_type;
+pub use datafusion_datasource::file_format::*;
+pub use datafusion_datasource::write;
 
 #[cfg(test)]
 pub(crate) mod test_util {
-    use super::*;
-    use crate::datasource::listing::PartitionedFile;
-    use crate::datasource::object_store::ObjectStoreUrl;
+    use arrow_schema::SchemaRef;
+    use datafusion_catalog::Session;
+    use datafusion_common::Result;
+    use datafusion_datasource::TableSchema;
+    use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+    use datafusion_datasource::{PartitionedFile, file_format::FileFormat};
+    use datafusion_execution::object_store::ObjectStoreUrl;
+    use std::sync::Arc;
+
     use crate::test::object_store::local_unpartitioned_file;
-    use object_store::local::LocalFileSystem;
 
     pub async fn scan_format(
+        state: &dyn Session,
         format: &dyn FileFormat,
+        schema: Option<SchemaRef>,
         store_root: &str,
         file_name: &str,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let store = Arc::new(LocalFileSystem::new()) as _;
-        let meta = local_unpartitioned_file(format!("{}/{}", store_root, file_name));
+    ) -> Result<Arc<dyn datafusion_physical_plan::ExecutionPlan>> {
+        let store = Arc::new(object_store::local::LocalFileSystem::new()) as _;
+        let meta = local_unpartitioned_file(format!("{store_root}/{file_name}"));
 
-        let file_schema = format.infer_schema(&store, &[meta.clone()]).await?;
+        let file_schema = if let Some(file_schema) = schema {
+            file_schema
+        } else {
+            format
+                .infer_schema(state, &store, std::slice::from_ref(&meta))
+                .await?
+        };
+
+        let table_schema = TableSchema::from(&file_schema);
 
         let statistics = format
-            .infer_stats(&store, file_schema.clone(), &meta)
+            .infer_stats(state, &store, file_schema.clone(), &meta)
             .await?;
 
-        let file_groups = vec![vec![PartitionedFile {
-            object_meta: meta,
-            partition_values: vec![],
-            range: None,
-            extensions: None,
-        }]];
+        let file_groups = vec![vec![PartitionedFile::new_from_meta(meta)].into()];
 
         let exec = format
             .create_physical_plan(
-                FileScanConfig {
-                    object_store_url: ObjectStoreUrl::local_filesystem(),
-                    file_schema,
-                    file_groups,
-                    statistics,
-                    projection,
-                    limit,
-                    table_partition_cols: vec![],
-                },
-                &[],
+                state,
+                FileScanConfigBuilder::new(
+                    ObjectStoreUrl::local_filesystem(),
+                    format.file_source(table_schema),
+                )
+                .with_file_groups(file_groups)
+                .with_statistics(statistics)
+                .with_projection_indices(projection)?
+                .with_limit(limit)
+                .build(),
             )
             .await?;
         Ok(exec)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "parquet")]
+    #[tokio::test]
+    async fn write_parquet_results_error_handling() -> datafusion_common::Result<()> {
+        use std::sync::Arc;
+
+        use object_store::local::LocalFileSystem;
+        use tempfile::TempDir;
+        use url::Url;
+
+        use crate::{
+            dataframe::DataFrameWriteOptions,
+            prelude::{CsvReadOptions, SessionContext},
+        };
+
+        let ctx = SessionContext::new();
+        // register a local file system object store for /tmp directory
+        let tmp_dir = TempDir::new()?;
+        let local = Arc::new(LocalFileSystem::new_with_prefix(&tmp_dir)?);
+        let local_url = Url::parse("file://local").unwrap();
+        ctx.register_object_store(&local_url, local);
+
+        let options = CsvReadOptions::default()
+            .schema_infer_max_records(2)
+            .has_header(true);
+        let df = ctx.read_csv("tests/data/corrupt.csv", options).await?;
+        let out_dir_url = "file://local/out";
+        let e = df
+            .write_parquet(out_dir_url, DataFrameWriteOptions::new(), None)
+            .await
+            .expect_err("should fail because input file does not match inferred schema");
+        assert_eq!(
+            e.strip_backtrace(),
+            "Arrow error: Parser error: Error while parsing value 'd' as type 'Int64' for column 0 at line 4. Row data: '[d,4]'"
+        );
+        Ok(())
     }
 }
