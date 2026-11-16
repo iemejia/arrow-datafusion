@@ -100,7 +100,7 @@ arrow-avro = { version = "59.0.0", default-features = false, features = [
     "bzip2",
     "xz",
 ] }
-arrow-buffer = { version = "59.0.0", default-features = false }
+arrow-buffer = { version = "60.1.0", default-features = false }
 arrow-data = { version = "59.0.0", default-features = false }
 arrow-flight = { version = "59.0.0", features = [
     "flight-sql-experimental",
